@@ -112,6 +112,47 @@ test('stable endpoints, IDs, bindings and persisted pool state on repeated impor
   assert.ok(!JSON.stringify(manager.status()).includes('fixture-only'))
 })
 
+test('ECH nodes retain secure DNS across import, reimport and restart', async (t) => {
+  const { manager, pool, dataDir, calls } = fixture(t)
+  const input = {
+    proxies: [
+      {
+        ...JSON.parse(yaml(['ech'])).proxies[0],
+        'ech-opts': { enable: true, 'query-server-name': 'cloudflare-ech.com' },
+      },
+    ],
+    dns: { enable: false, nameserver: ['127.0.0.1'] },
+  }
+  const expectedDns = {
+    enable: true,
+    ipv6: true,
+    'default-nameserver': ['1.1.1.1', '8.8.8.8'],
+    nameserver: ['https://cloudflare-dns.com/dns-query', 'https://dns.google/dns-query'],
+  }
+  const imported = { name: 'ech-airport', yaml: JSON.stringify(input) }
+  await manager.import(imported)
+  pool.reload()
+  const before = structuredClone(pool.state)
+  await manager.import(imported)
+  const restored = new ClashSubscriptions({
+    dataDir,
+    proxyPool: pool,
+    controller: manager.controller,
+    secret: manager.secret,
+    fetchImpl: manager.fetch,
+  })
+  await restored.restore()
+  assert.equal(calls.length, 3)
+  for (const config of calls) {
+    assert.deepEqual(config.dns, expectedDns)
+    assert.deepEqual(config.proxies[0]['ech-opts'], input.proxies[0]['ech-opts'])
+    assert.equal(config.proxies[0]['skip-cert-verify'], undefined)
+  }
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(dataDir, 'clash/config.yaml'), 'utf8')).dns, expectedDns)
+  pool.reload()
+  assert.deepEqual(pool.state, before)
+})
+
 test('missing nodes retire without endpoint reuse; returning nodes recover but manual disables remain', async (t) => {
   const { manager, pool, calls } = fixture(t)
   await manager.import({ name: 'airport', yaml: yaml() })

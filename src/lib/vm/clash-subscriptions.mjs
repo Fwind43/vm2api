@@ -229,6 +229,14 @@ export class ClashSubscriptions {
       secret: this.secret,
       'geo-auto-update': false,
       'geodata-loader': 'standard',
+      // ECH needs HTTPS (type 65) records; the system resolver cannot supply them.
+      // Use our own resolver policy instead of importing subscription DNS settings.
+      dns: {
+        enable: true,
+        ipv6: true,
+        'default-nameserver': ['1.1.1.1', '8.8.8.8'],
+        nameserver: ['https://cloudflare-dns.com/dns-query', 'https://dns.google/dns-query'],
+      },
       proxies: nodes.map((n) => ({ ...n.proxy, name: n.key })),
       listeners: nodes.map((n) => ({
         name: n.key,

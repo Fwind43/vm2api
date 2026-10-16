@@ -33,7 +33,7 @@ The sidecar/controller/listeners default to loopback, matching the existing host
 
 ## Supported input and limits
 
-Only inline `proxies` are imported, not subscription rules, DNS, scripts, TUN settings, providers or groups. Supported protocol types include SS/SSR, VMess/VLESS, Trojan, Hysteria/Hysteria2, TUIC, SOCKS5, HTTP, Snell, WireGuard, SSH, Mieru and AnyTLS, subject to Mihomo's validation. Unsafe external-file, plugin and dialer options are rejected. Unknown types are reported as skipped. A supported type does not guarantee a provider-specific option is accepted by the pinned Mihomo version.
+Only inline `proxies` are imported, not subscription rules, DNS, scripts, TUN settings, providers or groups. The generated sidecar configuration enables its own DNS resolver with Cloudflare/Google DNS-over-HTTPS and explicit bootstrap resolvers. This preserves HTTPS (type 65) records required by ECH nodes across imports and restarts; it does not disable ECH or relax certificate verification. Supported protocol types include SS/SSR, VMess/VLESS, Trojan, Hysteria/Hysteria2, TUIC, SOCKS5, HTTP, Snell, WireGuard, SSH, Mieru and AnyTLS, subject to Mihomo's validation. Unsafe external-file, plugin and dialer options are rejected. Unknown types are reported as skipped. A supported type does not guarantee a provider-specific option is accepted by the pinned Mihomo version.
 
 Maximum: 2 MiB input, 500 nodes per import. Base64/URI-only subscriptions and configurations containing only `proxy-providers` are unsupported; request the provider's Clash/Mihomo YAML. URL fetches allow HTTP(S), use bounded downloads, and reject private/local destinations including redirects and DNS results. For a private subscription server, upload its YAML instead.
 
