@@ -1,6 +1,7 @@
 # 文档
 
 - [DEPLOY.md](DEPLOY.md) — 安装与升级（含 `deploy/install.sh` 一键安装 / 更新）
+- [DOCKER_IMAGE.md](DOCKER_IMAGE.md) — 本分叉 GitHub Actions 一键构建镜像与 Compose 部署
 - [nginx-shell.md](nginx-shell.md) — 集群 / 槽运维终端 WebSocket 连不上时查 nginx Upgrade
 - [FORMAT.md](FORMAT.md) — 本地与 CI 同一套格式（Biome / gofmt / Prettier，LF）
 - [API.md](API.md) — `/v1`

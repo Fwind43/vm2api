@@ -35,6 +35,8 @@
 
 # 🇨🇳 简体中文
 
+> 本分叉包含 Clash 订阅导入；可在 [GitHub Actions](https://github.com/Fwind43/vm2api/actions/workflows/docker-image.yml) 一键构建双架构镜像 `ghcr.io/fwind43/vm2api:latest`，使用方法见 [镜像部署指南](docs/DOCKER_IMAGE.md)。
+
 ## 目录
 - [💡 项目概览](#-项目概览)
 - [🆕 近期更新](#-近期更新)

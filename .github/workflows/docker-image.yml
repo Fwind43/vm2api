@@ -1,0 +1,157 @@
+name: Build and publish Docker image
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Image tag to publish (latest or a custom tag)'
+        required: true
+        default: latest
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-image-${{ github.ref }}-${{ inputs.image_tag }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build and verify ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+            dockerfile: Dockerfile
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            dockerfile: deploy/Dockerfile.arm64-control
+    steps:
+      - uses: actions/checkout@v7
+      - name: Resolve image reference and validate tag
+        id: meta
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          ARCH: ${{ matrix.arch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$IMAGE_TAG" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127}$ ]] || { echo 'Invalid Docker tag'; exit 1; }
+          echo "image=ghcr.io/${GITHUB_REPOSITORY,,}:build-${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${ARCH}" >> "$GITHUB_OUTPUT"
+      - name: Prepare pinned ARM64 runtime
+        if: matrix.arch == 'arm64'
+        run: |
+          python3 deploy/prepare-arm64.py
+          python3 deploy/prepare-arm64.py --check
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build candidate image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/${{ matrix.arch }}
+          load: true
+          provenance: false
+          tags: ${{ steps.meta.outputs.image }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=fork-image-${{ matrix.arch }}
+          cache-to: type=gha,scope=fork-image-${{ matrix.arch }},mode=max
+      - name: Verify AMD64 startup, health, console and Clash module
+        if: matrix.arch == 'amd64'
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="vm2api-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          trap 'docker logs "$name" || true; docker rm -f "$name" >/dev/null 2>&1 || true' EXIT
+          docker run -d --name "$name" --network none \
+            -e VM2API_ADMIN_PASSWORD="$(openssl rand -hex 24)" \
+            -e DB_SECRET="$(openssl rand -hex 32)" \
+            "$IMAGE"
+          ready=false
+          for attempt in $(seq 1 60); do
+            if docker exec "$name" node -e 'fetch("http://127.0.0.1:8787/healthz").then(async r => { if (!r.ok || (await r.json()).status !== "ok") process.exit(1) }).catch(() => process.exit(1))'; then
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+          "$ready"
+          docker exec "$name" node --input-type=module -e '
+            import assert from "node:assert/strict";
+            import fs from "node:fs";
+            assert.equal(process.arch, "x64");
+            assert(fs.existsSync("src/lib/vm/clash-subscriptions.mjs"));
+            const response = await fetch("http://127.0.0.1:8787/console/");
+            assert.equal(response.status, 200);
+            assert.match(await response.text(), /<html/i);
+          '
+      - name: Verify native ARM64 and emulated payloads
+        if: matrix.arch == 'arm64'
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+        run: python3 test/deploy/smoke_arm64_image.py "$IMAGE"
+      - name: Publish verified architecture image
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+        run: docker push "$IMAGE"
+
+  publish:
+    name: Publish multi-architecture tag
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish and verify manifest
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          candidate="${image}:build-${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          sha_tag="sha-${GITHUB_SHA:0:12}"
+          targets=(-t "${image}:${IMAGE_TAG}")
+          if [[ "$IMAGE_TAG" != "$sha_tag" ]]; then targets+=(-t "${image}:${sha_tag}"); fi
+          docker buildx imagetools create "${targets[@]}" "${candidate}-amd64" "${candidate}-arm64"
+          docker buildx imagetools inspect --raw "${image}:${IMAGE_TAG}" | python3 -c '
+          import json, sys
+          platforms = {(m.get("platform") or {}).get("architecture") for m in json.load(sys.stdin).get("manifests", [])}
+          assert {"amd64", "arm64"} <= platforms, platforms
+          print("Verified platforms:", sorted(platforms))
+          '
+          digest=$(docker buildx imagetools inspect "${image}:${IMAGE_TAG}" --format '{{json .Manifest}}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["digest"])')
+          {
+            echo '## Verified Docker image'
+            echo "- Image: \`${image}:${IMAGE_TAG}\`"
+            echo "- Commit tag: \`${image}:${sha_tag}\`"
+            echo "- Digest: \`${digest}\`"
+            echo '- Platforms: linux/amd64, linux/arm64'
+            echo "- Pull: \`docker pull ${image}:${IMAGE_TAG}\`"
+            echo '- Deploy instructions: docs/DOCKER_IMAGE.md'
+          } >> "$GITHUB_STEP_SUMMARY"
