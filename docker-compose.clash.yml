@@ -1,0 +1,16 @@
+# Optional Linux host-network Mihomo sidecar. See docs/CLASH.md.
+services:
+  vm2api:
+    environment:
+      VM2API_CLASH_CONTROLLER: ${VM2API_CLASH_CONTROLLER:-http://127.0.0.1:19090}
+      VM2API_CLASH_SECRET: ${VM2API_CLASH_SECRET:?Set a random VM2API_CLASH_SECRET of at least 24 characters}
+    depends_on:
+      mihomo:
+        condition: service_started
+  mihomo:
+    image: ${VM2API_MIHOMO_IMAGE:-metacubex/mihomo:v1.19.32}
+    restart: unless-stopped
+    network_mode: host
+    command: ['-d', '/root/.config/mihomo', '-f', '/root/.config/mihomo/config.yaml']
+    volumes:
+      - ./data/clash:/root/.config/mihomo

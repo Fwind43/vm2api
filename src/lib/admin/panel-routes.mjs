@@ -4887,6 +4887,23 @@ export function createPanelHandler(ctx) {
         }
       }
       // ---- Proxy Pool ----
+      if (p === '/api/panel/proxies/clash') {
+        if (panelIdentity(req).role !== 'admin')
+          return json(res, 403, { ok: false, error: { message: 'Administrator required' } })
+        const manager = ctx.clashSubscriptions
+        if (!manager) return json(res, 503, { ok: false, error: { message: 'Clash integration unavailable' } })
+        if (req.method === 'GET') return json(res, 200, { ok: true, ...manager.status() })
+        if (req.method === 'POST') {
+          try {
+            const body = await readBody(req, 3 * 1024 * 1024)
+            const result = await manager.import(body)
+            return json(res, 200, { ok: true, ...result })
+          } catch (error) {
+            return json(res, 400, { ok: false, error: { code: 'clash_import_failed', message: error.message } })
+          }
+        }
+        return json(res, 405, { ok: false, error: { message: 'Method not allowed' } })
+      }
       if (req.method === 'GET' && p === '/api/panel/proxies') {
         const ident = panelIdentity(req)
         const snap = proxyPool.panelSnapshot({

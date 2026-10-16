@@ -69,6 +69,7 @@ import {
 import { makeError, ErrorType, ErrorCode } from './lib/core/errors.mjs'
 import * as panel from './lib/admin/panel-api.mjs'
 import { ProxyPool } from './lib/vm/proxy-pool.mjs'
+import { ClashSubscriptions } from './lib/vm/clash-subscriptions.mjs'
 import { ensureProxyEgress, proxyEgressReady } from './lib/vm/egress.mjs'
 import { syncIpv6ProxyEgress } from './lib/vm/proxy-policy-runtime.mjs'
 import { GATEWAY_CAPABILITIES } from './lib/vm/execution-context.mjs'
@@ -368,6 +369,12 @@ proxyPool = new ProxyPool({
   egressCheck: (proxy) => proxyEgressReady(proxy, cfg.paths.project),
   repairEgress: (proxy) => ensureProxyEgress(cfg.paths.project, proxy),
 })
+const clashSubscriptions = new ClashSubscriptions({ dataDir, proxyPool })
+try {
+  await clashSubscriptions.restore()
+} catch (error) {
+  console.warn('[clash] restore failed:', error.message)
+}
 proxyPool.startScheduler()
 
 // 首次安装的出口池是空的，槽没有可绑出口就起不来。本机出口永远成立，先补上。
@@ -946,6 +953,7 @@ const handlePanel = createPanelHandler({
   get proxyPool() {
     return proxyPool
   },
+  clashSubscriptions,
   apiKeyStore,
   apiEndpointStore,
   apiScheduler,

@@ -2,9 +2,11 @@ import { useState } from 'react'
 import { useMutation } from '@tanstack/react-query'
 import { House, Import } from 'lucide-react'
 import { toast } from 'sonner'
+import { useAuthStore } from '@/stores/auth-store'
 import { api } from '@/lib/api'
 import { Button } from '@/components/ui/button'
 import { Textarea } from '@/components/ui/textarea'
+import { ClashImportPanel } from './clash-import-panel'
 import { ProxyPanel } from './proxy-panel'
 import { useRefreshProxies } from './queries'
 
@@ -45,6 +47,7 @@ function countLines(raw: string): number {
 }
 
 export function ProxyImportPanel({ hasLocal }: { hasLocal: boolean }) {
+  const isAdmin = useAuthStore((s) => s.me?.role === 'admin')
   const refresh = useRefreshProxies()
   const [raw, setRaw] = useState('')
   const [outcome, setOutcome] = useState<ImportOutcome | null>(null)
@@ -145,6 +148,7 @@ export function ProxyImportPanel({ hasLocal }: { hasLocal: boolean }) {
         </Button>
       </div>
       {outcome ? <ImportSummary outcome={outcome} /> : null}
+      {isAdmin ? <ClashImportPanel /> : null}
     </ProxyPanel>
   )
 }
