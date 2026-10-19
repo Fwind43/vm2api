@@ -402,6 +402,15 @@ function selectionFailure(selected, { excluded, lastPolicy, lastResult, hops }) 
     last_status: lastResult?.status ?? null,
   }
   if (CAPACITY_SELECTION_REASONS.has(reason)) return poolOverloadedError(details)
+  if (reason === 'pool_egress_unavailable') {
+    const failed = poolError(
+      'pool_egress_unavailable',
+      'Bound proxy transport is temporarily unavailable; retry later',
+      details,
+    )
+    failed.retryAfterSec = Math.max(1, Math.ceil((Number(details.retry_after_ms) || 1000) / 1000))
+    return failed
+  }
   if (reason === 'pool_rate_limited') return poolRateLimitedError(details)
   if (reason === 'quota_guard_request_too_large') return quotaGuardTooLargeError(details)
   const failed = poolError('account_pool_exhausted', 'No eligible Claude accounts remain', details)
@@ -416,6 +425,11 @@ function applyCooldown(scheduler, selected, policy, model, { diagnosticPin = fal
   // VM / master pin is a diagnostic. A 401 from the wrong inbound class
   // must not forever-park a Setup Token that has no refresh by design.
   if (diagnosticPin && (policy.reason === 'oauth_no_refresh' || policy.reason === 'oauth_revoked')) {
+    return
+  }
+  if (policy.reason === 'proxy_transport_failure' && selected?.egressLease) {
+    selected.egressLease.failure()
+    scheduler.notifyCapacity?.()
     return
   }
   scheduler.markCooldown(selected, {
@@ -468,6 +482,7 @@ export class FailoverRunner {
   }
 
   noteUnitHealth(selected, policy, result) {
+    if (verifiedSuccess(result)) selected?.egressLease?.success()
     const circuit = this.scheduler?.unitCircuit
     if (!circuit || !selected?.accountId) return
     if (policy?.circuit) circuit.recordFailure(selected.accountId)
@@ -779,6 +794,7 @@ export class FailoverRunner {
       }
       if (!selected?.ok) {
         const exhausted = selectionFailure(selected, { excluded, lastPolicy, lastResult, hops: budget.hops })
+        if (selected.reason === 'pool_egress_unavailable') return { ...exhausted, ...attribution() }
         return preferLastResult(lastResult, lastPolicy, exhausted, attribution())
       }
       repairPending = false

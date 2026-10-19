@@ -234,6 +234,18 @@ function poolClientError(kind) {
 
 export function rewritePoolErrorForClient(mapped, originalBody = null) {
   const code = originalBody?.error?.code || mapped?.body?.error?.code
+  if (code === 'pool_egress_unavailable' && mapped?.status === 503) {
+    const retryMs = Number(originalBody?.error?.details?.retry_after_ms)
+    return {
+      ...makeError({
+        type: ErrorType.API,
+        code: 'pool_egress_unavailable',
+        message: 'Bound proxy transport is temporarily unavailable; retry later',
+        status: 503,
+      }),
+      retryAfterSec: Number.isFinite(retryMs) && retryMs > 0 ? Math.max(1, Math.ceil(retryMs / 1000)) : 1,
+    }
+  }
   const message = originalBody?.error?.message || mapped?.body?.error?.message || ''
   const kind = poolErrorKind(code, message)
   return kind ? poolClientError(kind) : mapped
