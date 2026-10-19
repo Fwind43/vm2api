@@ -7,9 +7,124 @@ import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
 import { useRefreshProxies } from './queries'
 
-type Status = {
-  configured: boolean
-  sources: { id: string; name: string; nodes: number }[]
+type Source = {
+  id: string
+  name: string
+  nodes: number
+  has_url: boolean
+  auto_refresh: boolean
+  refresh_interval_minutes: number
+  last_success_at: string | null
+  next_refresh_at: string | null
+  last_error: string | null
+}
+type Status = { configured: boolean; sources: Source[] }
+type SourceAction = {
+  action: 'refresh' | 'configure'
+  source_id: string
+  auto_refresh?: boolean
+  refresh_interval_minutes?: number
+}
+const timeLabel = (time: string | null) =>
+  time ? new Date(time).toLocaleString() : '—'
+
+function SourceRow({
+  source,
+  pending,
+  onAction,
+}: {
+  source: Source
+  pending: boolean
+  onAction: (action: SourceAction) => void
+}) {
+  const [interval, setInterval] = useState(
+    String(source.refresh_interval_minutes)
+  )
+  const minutes = Number(interval)
+  const configure = (enabled: boolean) =>
+    onAction({
+      action: 'configure',
+      source_id: source.id,
+      auto_refresh: enabled,
+      refresh_interval_minutes: minutes,
+    })
+  return (
+    <li className='space-y-2 rounded-md border p-3'>
+      <div>
+        {source.name} · {source.nodes} 个节点 ·{' '}
+        {source.auto_refresh ? '自动更新已开启' : '自动更新已关闭'}
+      </div>
+      {source.has_url ? (
+        <>
+          <div>
+            上次成功：{timeLabel(source.last_success_at)}；下次更新：
+            {timeLabel(source.next_refresh_at)}
+          </div>
+          {source.last_error ? (
+            <p role='alert' className='text-destructive'>
+              {source.last_error === 'bound_nodes_changed'
+                ? '在用节点配置变化，已保留旧配置；请确认后手动重导入。'
+                : '更新失败，已保留旧配置；开启自动更新时将于15分钟后重试。'}
+            </p>
+          ) : null}
+          <div className='flex flex-wrap items-center gap-2'>
+            <Button
+              type='button'
+              size='sm'
+              variant='outline'
+              disabled={pending}
+              onClick={() =>
+                onAction({ action: 'refresh', source_id: source.id })
+              }
+            >
+              立即更新
+            </Button>
+            <Input
+              type='number'
+              min={15}
+              max={10080}
+              step={1}
+              className='w-24'
+              aria-label={`${source.name} 更新间隔（分钟）`}
+              value={interval}
+              onChange={(e) => setInterval(e.target.value)}
+            />
+            <span>分钟</span>
+            <Button
+              type='button'
+              size='sm'
+              variant='outline'
+              disabled={
+                pending ||
+                !Number.isInteger(minutes) ||
+                minutes < 15 ||
+                minutes > 10080
+              }
+              onClick={() => configure(source.auto_refresh)}
+            >
+              保存间隔
+            </Button>
+            <Button
+              type='button'
+              size='sm'
+              variant='outline'
+              disabled={
+                pending ||
+                !Number.isInteger(minutes) ||
+                minutes < 15 ||
+                minutes > 10080
+              }
+              onClick={() => configure(!source.auto_refresh)}
+            >
+              {source.auto_refresh ? '暂停自动更新' : '开启自动更新'}
+            </Button>
+          </div>
+        </>
+      ) : (
+        <p>旧订阅或 YAML 导入未保存链接，请使用相同名称重新导入链接一次。</p>
+      )}
+    </li>
+  )
 }
 type Result = {
   added: number
@@ -27,6 +142,7 @@ export function ClashImportPanel() {
   const status = useQuery({
     queryKey: ['panel', 'clash-subscriptions'],
     queryFn: () => api<Status>('/api/panel/proxies/clash'),
+    refetchInterval: 60000,
   })
   const mutation = useMutation({
     mutationFn: () =>
@@ -48,6 +164,24 @@ export function ClashImportPanel() {
     },
   })
 
+  const sourceMutation = useMutation({
+    mutationFn: (action: SourceAction) =>
+      api('/api/panel/proxies/clash', {
+        method: 'POST',
+        body: JSON.stringify(action),
+      }),
+    onSuccess: (_, action) => {
+      toast.success(
+        action.action === 'refresh' ? '订阅已更新' : '自动更新设置已保存'
+      )
+      void refresh()
+      void status.refetch()
+    },
+    onError: () => {
+      void status.refetch()
+    },
+  })
+
   return (
     <section className='space-y-3 border-t pt-4' aria-label='Clash 订阅'>
       <div>
@@ -65,7 +199,7 @@ export function ClashImportPanel() {
       ) : null}
       {status.data && !status.data.configured ? (
         <p role='alert' className='text-xs text-muted-foreground'>
-          尚未配置 Mihomo。请按 docs/clash-subscriptions.md 启动专用内核并设置
+          尚未配置 Mihomo。请按 docs/CLASH.md 启动专用内核并设置
           VM2API_CLASH_CONTROLLER / VM2API_CLASH_SECRET。
         </p>
       ) : null}
@@ -84,6 +218,10 @@ export function ClashImportPanel() {
         value={url}
         onChange={(e) => setUrl(e.target.value)}
       />
+      <p className='text-xs text-muted-foreground'>
+        链接将在服务端保存（不回显），新订阅默认每6小时更新，重启后继续。
+        内容不变不重载；更新失败保留旧配置，在用节点变更需手动确认。
+      </p>
       <div className='text-xs text-muted-foreground'>
         或上传 / 粘贴 YAML（最多 2 MiB，500 个节点）
       </div>
@@ -137,18 +275,31 @@ export function ClashImportPanel() {
         disabled={
           !status.data?.configured ||
           mutation.isPending ||
+          sourceMutation.isPending ||
           !name.trim() ||
           (!url.trim() && !yaml.trim())
         }
       >
         {mutation.isPending ? '正在导入…' : '导入 / 更新 Clash 订阅'}
       </Button>
+      {sourceMutation.error ? (
+        <p role='alert' className='text-xs text-destructive'>
+          {sourceMutation.error.message}
+        </p>
+      ) : null}
       {status.data?.sources.length ? (
         <ul className='space-y-1 text-xs text-muted-foreground'>
           {status.data.sources.map((s) => (
-            <li key={s.id}>
-              {s.name} · {s.nodes} 个节点
-            </li>
+            <SourceRow
+              key={s.id}
+              source={s}
+              pending={
+                mutation.isPending ||
+                sourceMutation.isPending ||
+                !status.data.configured
+              }
+              onAction={(action) => sourceMutation.mutate(action)}
+            />
           ))}
         </ul>
       ) : null}

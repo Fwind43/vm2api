@@ -40,7 +40,10 @@ function fixture(t, options = {}) {
     },
     ...options,
   })
-  t.after(() => pool.stopScheduler())
+  t.after(() => {
+    manager.stopScheduler()
+    pool.stopScheduler()
+  })
   return { dataDir, pool, manager, calls }
 }
 
@@ -142,7 +145,7 @@ test('ECH nodes retain secure DNS across import, reimport and restart', async (t
     fetchImpl: manager.fetch,
   })
   await restored.restore()
-  assert.equal(calls.length, 3)
+  assert.equal(calls.length, 2) // Unchanged reimport must not reload Mihomo.
   for (const config of calls) {
     assert.deepEqual(config.dns, expectedDns)
     assert.deepEqual(config.proxies[0]['ech-opts'], input.proxies[0]['ech-opts'])
@@ -207,4 +210,233 @@ test('configuration guard, URL import and administrator-only ACL', async (t) => 
     assert.equal(authorizePanelRoute(method, '/api/panel/proxies/clash', 'admin').ok, true)
     assert.equal(authorizePanelRoute(method, '/api/panel/proxies/clash', 'user').ok, false)
   }
+})
+
+const persisted = (dataDir) => JSON.parse(fs.readFileSync(path.join(dataDir, 'clash', 'subscriptions.json'), 'utf8'))
+const later = (time, minutes) => new Date(time + minutes * 60000).toISOString()
+
+test('URL and schedule survive restart; status never returns tokens or node credentials', async (t) => {
+  let now = Date.parse('2026-10-19T12:00:00Z')
+  let downloads = 0
+  const url = 'https://provider.example/sub?token=private-fixture-token'
+  const download = async (value) => {
+    assert.equal(value, url)
+    downloads++
+    return yaml()
+  }
+  const { manager, pool, dataDir } = fixture(t, { now: () => now, download })
+  await manager.import({ name: 'saved', url })
+  const saved = persisted(dataDir).sources[0]
+  assert.equal(saved.url, url)
+  assert.equal(saved.auto_refresh, true)
+  assert.equal(saved.refresh_interval_minutes, 360)
+  assert.equal(saved.next_refresh_at, later(now, 360))
+  assert.doesNotMatch(JSON.stringify(manager.status()), /private-fixture-token|fixture-only|https:\/\//)
+  const restarted = new ClashSubscriptions({
+    dataDir,
+    proxyPool: pool,
+    controller: manager.controller,
+    secret: manager.secret,
+    fetchImpl: manager.fetch,
+    download,
+    now: () => now,
+  })
+  await restarted.restore()
+  await restarted.runDue()
+  assert.equal(downloads, 1)
+  now += 361 * 60000
+  await restarted.runDue()
+  assert.equal(downloads, 2)
+  assert.equal(persisted(dataDir).sources[0].id, saved.id)
+  assert.equal(persisted(dataDir).sources[0].last_success_at, later(now, 0))
+  assert.equal(persisted(dataDir).sources[0].next_refresh_at, later(now, 360))
+})
+
+test('unchanged refresh and multi-source reimport preserve endpoints, config and pool bytes', async (t) => {
+  let now = Date.parse('2026-10-19T12:00:00Z')
+  const { manager, pool, calls, dataDir } = fixture(t, { now: () => now, download: async () => yaml() })
+  await manager.import({ name: 'first', url: 'https://provider.example/first' })
+  await manager.import({ name: 'second', yaml: yaml(['other']) })
+  const before = structuredClone(manager.state.sources)
+  const config = fs.readFileSync(path.join(dataDir, 'clash', 'config.yaml'), 'utf8')
+  const poolState = structuredClone(pool.state)
+  const count = calls.length
+  now += 360 * 60000
+  assert.equal((await manager.refresh(before[0].id)).unchanged, true)
+  assert.equal((await manager.refresh(before[0].id)).unchanged, true)
+  assert.equal(calls.length, count)
+  assert.deepEqual(pool.state, poolState)
+  assert.equal(fs.readFileSync(path.join(dataDir, 'clash', 'config.yaml'), 'utf8'), config)
+  assert.deepEqual(
+    persisted(dataDir).sources.map((s) => s.nodes),
+    before.map((s) => s.nodes),
+  )
+  assert.deepEqual(
+    manager.state.sources.map((s) => s.id),
+    before.map((s) => s.id),
+  )
+})
+
+test('download failure retains last good nodes, config and success time; retries after 15 minutes', async (t) => {
+  let now = Date.parse('2026-10-19T12:00:00Z')
+  let broken = false
+  let attempts = 0
+  const { manager, pool, calls, dataDir } = fixture(t, {
+    now: () => now,
+    download: async () => {
+      attempts++
+      if (broken) throw new Error('https://provider.example/private-token secret-password')
+      return yaml()
+    },
+  })
+  await manager.import({ name: 'saved', url: 'https://provider.example/sub' })
+  const before = structuredClone(manager.state.sources[0])
+  const poolState = structuredClone(pool.state)
+  const config = fs.readFileSync(path.join(dataDir, 'clash', 'config.yaml'), 'utf8')
+  broken = true
+  now += 360 * 60000
+  await assert.rejects(manager.refresh(before.id), (error) => {
+    assert.doesNotMatch(error.message, /private-token|secret-password/)
+    return /previous configuration retained/.test(error.message)
+  })
+  const after = persisted(dataDir).sources[0]
+  assert.deepEqual(after.nodes, before.nodes)
+  assert.equal(after.last_success_at, before.last_success_at)
+  assert.equal(after.last_error, 'refresh_failed')
+  assert.equal(after.next_refresh_at, later(now, 15))
+  assert.equal(calls.length, 1)
+  assert.deepEqual(pool.state, poolState)
+  assert.equal(fs.readFileSync(path.join(dataDir, 'clash', 'config.yaml'), 'utf8'), config)
+  assert.doesNotMatch(JSON.stringify(manager.status()), /private-token|secret-password/)
+  await manager.runDue()
+  assert.equal(attempts, 2)
+  broken = false
+  now += 15 * 60000
+  await manager.runDue()
+  assert.equal(attempts, 3)
+  assert.equal(manager.status().sources[0].last_error, null)
+})
+
+test('invalid YAML and controller rejection retain saved configuration on refresh', async (t) => {
+  let text = yaml()
+  const { manager, calls, dataDir } = fixture(t, { download: async () => text })
+  await manager.import({ name: 'saved', url: 'https://provider.example/sub' })
+  const id = manager.state.sources[0].id
+  const before = persisted(dataDir).sources[0].nodes
+  text = 'invalid: yaml'
+  await assert.rejects(manager.refresh(id), /refresh failed/)
+  assert.deepEqual(persisted(dataDir).sources[0].nodes, before)
+  text = yaml(['new'])
+  manager.fetch = async () => ({ ok: false, status: 400, text: async () => 'sensitive-provider-error' })
+  await assert.rejects(manager.refresh(id), /refresh failed/)
+  assert.deepEqual(persisted(dataDir).sources[0].nodes, before)
+  assert.equal(calls.length, 1)
+})
+
+test('automatic and saved-URL refresh refuse changed or removed bound nodes; explicit import can confirm', async (t) => {
+  let text = yaml()
+  const { manager, pool, calls, dataDir } = fixture(t, { download: async () => text })
+  await manager.import({ name: 'saved', url: 'https://provider.example/sub' })
+  const id = manager.state.sources[0].id
+  const row = pool.state.proxies[0]
+  row.bound_vm_id = JSON.stringify(['vm-01', 'vm-02'])
+  pool.save()
+  const before = structuredClone(manager.state.sources[0].nodes)
+  const parsed = JSON.parse(yaml())
+  parsed.proxies[0].password = 'rotated-fixture'
+  text = JSON.stringify(parsed)
+  await assert.rejects(manager.refresh(id), /Bound nodes changed/)
+  assert.deepEqual(persisted(dataDir).sources[0].nodes, before)
+  assert.equal(manager.status().sources[0].last_error, 'bound_nodes_changed')
+  assert.equal(calls.length, 1)
+  text = yaml(['two'])
+  await assert.rejects(manager.refresh(id), /Bound nodes changed/)
+  assert.equal(calls.length, 1)
+  text = JSON.stringify(parsed)
+  await manager.import({ name: 'saved', url: 'https://provider.example/sub' })
+  assert.equal(calls.length, 2)
+  assert.equal(pool.state.proxies[0].id, row.id)
+  assert.equal(pool.state.proxies[0].bound_vm_id, row.bound_vm_id)
+})
+
+test('unbound nodes can update automatically without changing IDs or listener credentials', async (t) => {
+  let text = yaml()
+  const { manager, calls } = fixture(t, { download: async () => text })
+  await manager.import({ name: 'saved', url: 'https://provider.example/sub' })
+  const before = structuredClone(manager.state.sources[0])
+  const parsed = JSON.parse(text)
+  parsed.proxies[0].server = 'new.example.com'
+  text = JSON.stringify(parsed)
+  await manager.refresh(before.id)
+  const after = manager.state.sources[0]
+  assert.equal(calls.length, 2)
+  for (const field of ['key', 'port', 'username', 'password'])
+    assert.equal(after.nodes[0][field], before.nodes[0][field])
+  assert.equal(after.nodes[0].proxy.server, 'new.example.com')
+})
+
+test('settings persist interval and pause; YAML import clears saved URL and disables refresh', async (t) => {
+  let now = Date.parse('2026-10-19T12:00:00Z')
+  let downloads = 0
+  const { manager, dataDir } = fixture(t, {
+    now: () => now,
+    download: async () => {
+      downloads++
+      return yaml()
+    },
+  })
+  await manager.import({ name: 'saved', url: 'https://provider.example/sub' })
+  const id = manager.state.sources[0].id
+  manager.configure({ source_id: id, auto_refresh: false, refresh_interval_minutes: 30 })
+  assert.equal(persisted(dataDir).sources[0].next_refresh_at, null)
+  now += 400 * 60000
+  await manager.runDue()
+  assert.equal(downloads, 1)
+  await manager.refresh(id) // Manual refresh still works while paused.
+  assert.equal(manager.status().sources[0].auto_refresh, false)
+  manager.configure({ source_id: id, auto_refresh: true, refresh_interval_minutes: 30 })
+  assert.equal(persisted(dataDir).sources[0].next_refresh_at, later(now, 30))
+  await manager.import({ name: 'saved', yaml: yaml() })
+  assert.equal(persisted(dataDir).sources[0].url, null)
+  assert.equal(manager.status().sources[0].auto_refresh, false)
+  assert.throws(() => manager.configure({ source_id: id, auto_refresh: true }), /Reimport/)
+  await assert.rejects(manager.refresh(id), /Reimport/)
+})
+
+test('interval validation, busy lock and scheduler lifecycle are bounded', async (t) => {
+  let release
+  const { manager } = fixture(t, {
+    download: () =>
+      new Promise((resolve) => {
+        release = resolve
+      }),
+  })
+  for (const interval of [0, 14, 10081, 30.5, 'bad'])
+    await assert.rejects(
+      manager.import({ name: 'bad', yaml: yaml(), refresh_interval_minutes: interval }),
+      /Refresh interval/,
+    )
+  const importing = manager.import({ name: 'saved', url: 'https://provider.example/sub' })
+  await assert.rejects(manager.import({ name: 'other', yaml: yaml() }), /in progress/)
+  await assert.rejects(manager.refresh('missing'), /in progress/)
+  release(yaml())
+  await importing
+  const id = manager.state.sources[0].id
+  assert.throws(() => manager.configure({ source_id: id, auto_refresh: 'true' }), /boolean/)
+  assert.throws(
+    () => manager.configure({ source_id: id, auto_refresh: true, refresh_interval_minutes: 14 }),
+    /Refresh interval/,
+  )
+  let runs = 0
+  manager.runDue = async () => {
+    runs++
+  }
+  manager.startScheduler()
+  const timer = manager.timer
+  manager.startScheduler()
+  assert.equal(manager.timer, timer)
+  assert.equal(runs, 1)
+  manager.stopScheduler()
+  manager.stopScheduler()
+  assert.equal(manager.timer, null)
 })

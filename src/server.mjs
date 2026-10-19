@@ -378,6 +378,7 @@ try {
 } catch (error) {
   console.warn('[clash] restore failed:', error.message)
 }
+clashSubscriptions.startScheduler()
 // An upgrade replaces bin/ files; slots mounting data/run/slot-guest-bin must see the new ones.
 try {
   refreshSlotGuestBinDir(cfg.paths.project)
@@ -1258,6 +1259,7 @@ function shutdown(signal) {
     backupService.stopScheduler()
   } catch {}
   try {
+    clashSubscriptions.stopScheduler()
     proxyPool.stopScheduler()
   } catch {}
   try {

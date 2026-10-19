@@ -5,9 +5,19 @@ import http from 'node:http'
 import https from 'node:https'
 import dns from 'node:dns'
 import net from 'node:net'
+import { isDeepStrictEqual } from 'node:util'
 import { parseDocument } from 'yaml'
 
 export const CLASH_MAX_BYTES = 2 * 1024 * 1024
+export const CLASH_REFRESH_MINUTES = 360
+const RETRY_MINUTES = 15
+const refreshMinutes = (value = CLASH_REFRESH_MINUTES) => {
+  const minutes = Number(value)
+  if (!Number.isInteger(minutes) || minutes < 15 || minutes > 10080)
+    fail('Refresh interval must be an integer between 15 and 10080 minutes')
+  return minutes
+}
+const nextRefresh = (now, minutes) => new Date(now + minutes * 60000).toISOString()
 const MAX_NODES = 500
 const TYPES = new Set([
   'ss',
@@ -189,6 +199,7 @@ export class ClashSubscriptions {
     portStart = Number(process.env.VM2API_CLASH_PORT_START || 20000),
     fetchImpl = fetch,
     download = downloadClash,
+    now = Date.now,
   } = {}) {
     this.dir = path.join(dataDir, 'clash')
     this.proxyPool = proxyPool
@@ -199,7 +210,9 @@ export class ClashSubscriptions {
     this.portStart = portStart
     this.fetch = fetchImpl
     this.download = download
+    this.now = now
     this.busy = false
+    this.timer = null
     this.state = { version: 1, sources: [] }
     const statePath = path.join(this.dir, 'subscriptions.json')
     if (fs.existsSync(statePath)) this.state = JSON.parse(fs.readFileSync(statePath, 'utf8'))
@@ -214,6 +227,13 @@ export class ClashSubscriptions {
         nodes: s.nodes.filter((n) => !n.retired).length,
         retired: s.nodes.filter((n) => n.retired).length,
         updated_at: s.updated_at,
+        has_url: !!s.url,
+        auto_refresh: !!s.url && s.auto_refresh === true,
+        refresh_interval_minutes: s.refresh_interval_minutes || CLASH_REFRESH_MINUTES,
+        last_attempt_at: s.last_attempt_at || null,
+        last_success_at: s.last_success_at || null,
+        next_refresh_at: s.next_refresh_at || null,
+        last_error: s.last_error || null,
       })),
     }
   }
@@ -321,69 +341,226 @@ export class ClashSubscriptions {
     return result
   }
 
-  async import({ name, url, yaml } = {}) {
+  persist(next) {
+    try {
+      atomicWrite(path.join(this.dir, 'subscriptions.json'), next)
+    } catch {
+      fail('Cannot persist Clash state; check data directory permissions')
+    }
+    this.state = next
+  }
+
+  source(id) {
+    const source = this.state.sources.find((s) => s.id === id)
+    if (!source) fail('Subscription not found')
+    return source
+  }
+
+  configure({ source_id, auto_refresh, refresh_interval_minutes } = {}) {
     if (this.busy) fail('Another Clash import is in progress')
-    if (!this.controller || !this.secret) fail('Enable the Mihomo sidecar first')
-    name = typeof name === 'string' ? name.trim() : ''
-    if (!name || name.length > 80) fail('Subscription name is required (at most 80 characters)')
-    if (!!url === !!yaml) fail('Provide either a subscription URL or YAML, not both')
+    const previous = this.source(source_id)
+    if (typeof auto_refresh !== 'boolean') fail('auto_refresh must be a boolean')
+    if (auto_refresh && !previous.url) fail('Reimport this subscription URL once to enable automatic updates')
+    const interval = refreshMinutes(refresh_interval_minutes ?? previous.refresh_interval_minutes)
+    const source = {
+      ...previous,
+      auto_refresh,
+      refresh_interval_minutes: interval,
+      next_refresh_at: auto_refresh ? nextRefresh(this.now(), interval) : null,
+    }
+    this.persist({ ...this.state, sources: this.state.sources.map((s) => (s.id === source_id ? source : s)) })
+    return { source: this.status().sources.find((s) => s.id === source_id) }
+  }
+
+  startScheduler() {
+    if (this.timer || !this.controller || !this.secret) return
+    this.timer = setInterval(() => {
+      void this.runDue().catch(() => {})
+    }, 60000)
+    this.timer.unref?.()
+    void this.runDue().catch(() => {})
+  }
+
+  stopScheduler() {
+    if (this.timer) clearInterval(this.timer)
+    this.timer = null
+  }
+
+  async runDue() {
+    if (this.dueRunning || this.busy || !this.controller || !this.secret) return
+    this.dueRunning = true
+    try {
+      const due = this.state.sources.filter(
+        (s) => s.url && s.auto_refresh && (!s.next_refresh_at || Date.parse(s.next_refresh_at) <= this.now()),
+      )
+      for (const source of due) {
+        if (this.busy) break
+        await this.refresh(source.id).catch(() => {})
+      }
+    } finally {
+      this.dueRunning = false
+    }
+  }
+
+  async refresh(id) {
+    if (this.busy) fail('Another Clash import is in progress')
+    const previous = this.source(id)
+    if (!previous.url) fail('Reimport this subscription URL once to enable updates')
     this.busy = true
     try {
-      const { proxies, skipped } = parseClash(url ? await this.download(url) : yaml)
-      const previous = this.state.sources.find((s) => s.name === name)
-      const source = { id: previous?.id || crypto.randomUUID(), name, updated_at: new Date().toISOString(), nodes: [] }
-      const used = new Set(this.state.sources.flatMap((s) => s.nodes.map((n) => n.port)))
-      for (const proxy of proxies) {
-        const old = previous?.nodes.find((n) => n.proxy.name === proxy.name)
-        let port = old?.port
-        if (!port) {
-          port = this.portStart
-          while (used.has(port)) port++
-          if (!Number.isInteger(port) || port < 1024 || port > 65535) fail('Clash listener port range exhausted')
-          used.add(port)
-        }
-        source.nodes.push({
-          key: old?.key || `clash-${crypto.randomUUID()}`,
-          port,
-          username: old?.username || crypto.randomBytes(12).toString('hex'),
-          password: old?.password || crypto.randomBytes(24).toString('hex'),
-          retired: false,
-          proxy,
-        })
-      }
-      // Missing nodes are retained, not silently replaced: bound slots must never switch exits.
-      const retired = previous?.nodes.filter((n) => !proxies.some((p) => p.name === n.proxy.name)) || []
-      source.nodes.push(
-        ...retired.map((n) => ({
-          ...n,
-          retired: true,
-          resume_enabled: n.retired
-            ? n.resume_enabled
-            : this.proxyPool.state.proxies.find(
-                (p) => p.host === this.host && p.port === n.port && p.username === n.username,
-              )?.enabled !== false,
-        })),
+      return await this.importLocked(
+        {
+          name: previous.name,
+          url: previous.url,
+          auto_refresh: previous.auto_refresh === true,
+          refresh_interval_minutes: previous.refresh_interval_minutes,
+        },
+        true,
       )
-      const next = { version: 1, sources: [...this.state.sources.filter((s) => s.name !== name), source] }
-      const config = await this.apply(next)
-      try {
-        atomicWrite(path.join(this.dir, 'config.yaml'), config)
-        atomicWrite(path.join(this.dir, 'subscriptions.json'), next)
-      } catch {
-        await this.apply(this.state).catch(() => {})
-        fail('Cannot persist Clash state; check data directory permissions')
+    } catch (error) {
+      // Never persist/return provider errors: they may contain a subscription token or YAML credentials.
+      const code = error.code === 'bound_nodes_changed' ? 'bound_nodes_changed' : 'refresh_failed'
+      const current = this.source(id)
+      const source = {
+        ...current,
+        last_attempt_at: new Date(this.now()).toISOString(),
+        last_error: code,
+        next_refresh_at: current.auto_refresh
+          ? nextRefresh(this.now(), Math.min(current.refresh_interval_minutes || CLASH_REFRESH_MINUTES, RETRY_MINUTES))
+          : null,
       }
-      this.state = next
-      const result = this.syncPool(previous)
+      this.persist({ ...this.state, sources: this.state.sources.map((s) => (s.id === id ? source : s)) })
+      fail(
+        code === 'bound_nodes_changed'
+          ? 'Bound nodes changed; previous configuration retained. Review and reimport manually.'
+          : 'Subscription refresh failed; previous configuration retained',
+      )
+    } finally {
+      this.busy = false
+    }
+  }
+
+  async import(options = {}) {
+    if (this.busy) fail('Another Clash import is in progress')
+    this.busy = true
+    try {
+      return await this.importLocked(options)
+    } finally {
+      this.busy = false
+    }
+  }
+
+  async importLocked({ name, url, yaml, auto_refresh, refresh_interval_minutes } = {}, protectBound = false) {
+    if (!this.controller || !this.secret) fail('Enable the Mihomo sidecar first')
+    name = typeof name === 'string' ? name.trim() : ''
+    url = typeof url === 'string' ? url.trim() : url
+    if (!name || name.length > 80) fail('Subscription name is required (at most 80 characters)')
+    if (!!url === !!yaml) fail('Provide either a subscription URL or YAML, not both')
+    if (auto_refresh !== undefined && typeof auto_refresh !== 'boolean') fail('auto_refresh must be a boolean')
+    if (auto_refresh && !url) fail('Automatic updates require a subscription URL')
+    const previous = this.state.sources.find((s) => s.name === name)
+    const interval = refreshMinutes(refresh_interval_minutes ?? previous?.refresh_interval_minutes)
+    const { proxies, skipped } = parseClash(url ? await this.download(url) : yaml)
+    const now = this.now()
+    const automatic = !!url && (auto_refresh ?? previous?.auto_refresh ?? true)
+    const source = {
+      id: previous?.id || crypto.randomUUID(),
+      name,
+      updated_at: new Date(now).toISOString(),
+      url: url || null,
+      auto_refresh: automatic,
+      refresh_interval_minutes: interval,
+      last_attempt_at: new Date(now).toISOString(),
+      last_success_at: new Date(now).toISOString(),
+      next_refresh_at: automatic ? nextRefresh(now, interval) : null,
+      last_error: null,
+      nodes: [],
+    }
+    const used = new Set(this.state.sources.flatMap((s) => s.nodes.map((n) => n.port)))
+    for (const proxy of proxies) {
+      const old = previous?.nodes.find((n) => n.proxy.name === proxy.name)
+      let port = old?.port
+      if (!port) {
+        port = this.portStart
+        while (used.has(port)) port++
+        if (!Number.isInteger(port) || port < 1024 || port > 65535) fail('Clash listener port range exhausted')
+        used.add(port)
+      }
+      source.nodes.push({
+        key: old?.key || `clash-${crypto.randomUUID()}`,
+        port,
+        username: old?.username || crypto.randomBytes(12).toString('hex'),
+        password: old?.password || crypto.randomBytes(24).toString('hex'),
+        retired: false,
+        proxy,
+      })
+    }
+    // Missing nodes are retained, not silently replaced: bound slots must never switch exits.
+    const retired = previous?.nodes.filter((n) => !proxies.some((p) => p.name === n.proxy.name)) || []
+    source.nodes.push(
+      ...retired.map((n) => ({
+        ...n,
+        retired: true,
+        resume_enabled: n.retired
+          ? n.resume_enabled
+          : this.proxyPool.state.proxies.find(
+              (p) => p.host === this.host && p.port === n.port && p.username === n.username,
+            )?.enabled !== false,
+      })),
+    )
+    const next = {
+      version: 1,
+      sources: previous
+        ? this.state.sources.map((s) => (s.id === previous.id ? source : s))
+        : [...this.state.sources, source],
+    }
+    // Updates may not silently change a live slot's route (including credential rotations).
+    if (protectBound && previous) {
+      for (const old of previous.nodes) {
+        const row = this.proxyPool.state.proxies.find(
+          (p) => p.host === this.host && p.port === old.port && p.username === old.username,
+        )
+        if (!row?.bound_vm_id && !row?.bound_vm_ids?.length) continue
+        const node = source.nodes.find((n) => n.key === old.key)
+        if (old.retired !== node?.retired || !isDeepStrictEqual(old.proxy, node?.proxy)) {
+          const error = new Error('Bound nodes changed')
+          error.code = 'bound_nodes_changed'
+          throw error
+        }
+      }
+    }
+    const unchanged = isDeepStrictEqual(this.config(this.state), this.config(next))
+    if (unchanged) {
+      this.persist(next)
       return {
-        added: result.added,
-        updated: proxies.length - result.added,
+        added: 0,
+        updated: 0,
+        unchanged: true,
         retained_disabled: retired.length,
         skipped,
         source: { id: source.id, name: source.name, nodes: proxies.length },
       }
-    } finally {
-      this.busy = false
+    }
+    const config = await this.apply(next)
+    try {
+      atomicWrite(path.join(this.dir, 'config.yaml'), config)
+      atomicWrite(path.join(this.dir, 'subscriptions.json'), next)
+    } catch {
+      await this.apply(this.state).catch(() => {})
+      try {
+        atomicWrite(path.join(this.dir, 'config.yaml'), this.config(this.state))
+      } catch {}
+      fail('Cannot persist Clash state; check data directory permissions')
+    }
+    this.state = next
+    const result = this.syncPool(previous)
+    return {
+      added: result.added,
+      updated: proxies.length - result.added,
+      unchanged: false,
+      retained_disabled: retired.length,
+      skipped,
+      source: { id: source.id, name: source.name, nodes: proxies.length },
     }
   }
 }

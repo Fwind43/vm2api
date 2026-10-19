@@ -5179,7 +5179,15 @@ export function createPanelHandler(ctx) {
         if (req.method === 'POST') {
           try {
             const body = await readBody(req, 3 * 1024 * 1024)
-            const result = await manager.import(body)
+            const action = body.action || 'import'
+            if (!['import', 'refresh', 'configure'].includes(action))
+              return json(res, 400, { ok: false, error: { message: 'Unknown Clash action' } })
+            const result =
+              action === 'refresh'
+                ? await manager.refresh(body.source_id)
+                : action === 'configure'
+                  ? manager.configure(body)
+                  : await manager.import(body)
             return json(res, 200, { ok: true, ...result })
           } catch (error) {
             return json(res, 400, { ok: false, error: { code: 'clash_import_failed', message: error.message } })
