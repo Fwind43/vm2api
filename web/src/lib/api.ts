@@ -1,5 +1,10 @@
 import type { VmActiveHours, VmQuotaOverride } from '@/types/panel-vm'
-import { apiBase, clearSession, hasSession, sessionToken } from '@/lib/session'
+import {
+  apiBase,
+  expirePanelSession,
+  hasSession,
+  sessionToken,
+} from '@/lib/session'
 
 export type PanelErrorMetadata = {
   type?: string
@@ -102,16 +107,22 @@ function unwrapEnvelope(payload: unknown, status: number): unknown {
   return body.data !== undefined ? body.data : payload
 }
 
+function isPanelApiPath(path: string): boolean {
+  return path.startsWith('/api/panel/') && path !== '/api/panel/login'
+}
+
 export async function panelFetch(
   path: string,
   opts: RequestInit = {}
 ): Promise<Response> {
   const url = `${apiBase() || ''}${path}`
-  return fetch(url, {
+  const res = await fetch(url, {
     ...opts,
     credentials: 'include',
     headers: { ...authHeaders(), ...(opts.headers || {}) },
   })
+  if (res.status === 401 && isPanelApiPath(path)) expirePanelSession()
+  return res
 }
 
 export async function api<T = unknown>(
@@ -122,8 +133,7 @@ export async function api<T = unknown>(
   const res = await panelFetch(path, opts)
   const json = (await res.json().catch(() => ({}))) as Json
   if (res.status === 401) {
-    clearSession()
-    throw apiErrorFrom(json, res.status, '鉴权失效，请重新登录')
+    throw apiErrorFrom(json, res.status, '登录已过期')
   }
   if (!res.ok) {
     throw apiErrorFrom(json, res.status, res.statusText || '请求失败')
@@ -146,6 +156,9 @@ export type VmPatch = {
   schedule_level?: number | 'auto' | null
   /** null = 清除工作时段，恢复 24h 接单。 */
   active_hours?: VmActiveHours | null
+  /** Docker 槽在线提升内存（仅上调）。 */
+  memory?: string
+  machine?: { memory?: string }
 }
 
 export function patchVm<T = unknown>(id: string, body: VmPatch) {

@@ -25,6 +25,14 @@ export function streamIdleTimeoutMs(routing, fallbackMs = Number(process.env.KIN
   return Math.min(STREAM_IDLE_TIMEOUT_MAX_MS, Math.max(STREAM_IDLE_TIMEOUT_MIN_MS, Math.round(ms)))
 }
 
+/** Gateway stream path: panel routing → cfg.limits → KIN_STREAM_IDLE_TIMEOUT → 180s default. */
+export function resolveStreamIdleTimeoutMs(routing, cfg) {
+  const limitsMs = Number(cfg?.limits?.stream_idle_timeout_ms)
+  const fallback =
+    Number.isFinite(limitsMs) && limitsMs > 0 ? limitsMs : Number(process.env.KIN_STREAM_IDLE_TIMEOUT) || 180_000
+  return streamIdleTimeoutMs(routing, fallback)
+}
+
 /**
  * How long a Claude stream may sit in the queue before the first downstream
  * byte. Cloudflare returns 524 when the origin writes nothing for ~100s.
@@ -99,6 +107,45 @@ export function readRoutingConfigFile(projectRoot = PROJECT) {
   }
 }
 
+const BIND_WILDCARD_HOSTS = new Set(['0.0.0.0', '::', '[::]'])
+
+/** Listen/bind addresses that must never appear in client-facing URLs. */
+export function isBindWildcardHost(host) {
+  const h = String(host ?? '')
+    .trim()
+    .toLowerCase()
+  return BIND_WILDCARD_HOSTS.has(h)
+}
+
+function trimPublicBaseUrl(raw) {
+  if (raw == null) return null
+  const s = String(raw).trim().replace(/\/+$/, '')
+  return s || null
+}
+
+/** PUBLIC_HOST only; never falls back to HOST (bind address). */
+export function resolvePublicHost(env = process.env) {
+  const publicHost = String(env.PUBLIC_HOST ?? '').trim()
+  if (!publicHost || isBindWildcardHost(publicHost)) return null
+  return publicHost
+}
+
+/**
+ * Client-facing base URL for /health, /v1/meta, and panel snapshots.
+ * PUBLIC_BASE_URL wins; else build from PUBLIC_HOST. Unconfigured → null.
+ */
+export function resolvePublicBaseUrl(env = process.env, port = Number(env.PORT || 8787)) {
+  const explicit = trimPublicBaseUrl(env.PUBLIC_BASE_URL)
+  if (explicit) return explicit
+
+  const publicHost = resolvePublicHost(env)
+  if (!publicHost) return null
+
+  const scheme = String(env.PUBLIC_SCHEME || 'http').trim() || 'http'
+  const needsPort = scheme !== 'https'
+  return `${scheme}://${publicHost}${needsPort ? `:${port}` : ''}`
+}
+
 function readActiveVmRecord(projectRoot) {
   try {
     const active = JSON.parse(fs.readFileSync(path.join(projectRoot, 'vms', 'active.json'), 'utf8'))
@@ -165,15 +212,14 @@ export function loadConfig() {
 
   const port = Number(process.env.PORT || 8787)
   const host = process.env.HOST || '0.0.0.0'
-  const publicHost = process.env.PUBLIC_HOST || process.env.HOST || '127.0.0.1'
+  const publicHost = resolvePublicHost(process.env)
+  const base_url = resolvePublicBaseUrl(process.env, port)
 
   const cfg = {
     port,
     host,
     public_host: publicHost,
-    base_url:
-      process.env.PUBLIC_BASE_URL ||
-      `${process.env.PUBLIC_SCHEME || 'http'}://${publicHost}${String(process.env.PUBLIC_SCHEME || 'http') === 'https' ? '' : ':' + port}`,
+    base_url,
     api_key: apiKey,
     api_key_hash: hashKey(apiKey),
     // rewrite pipeline — DEFAULT OFF (passthrough preferred)

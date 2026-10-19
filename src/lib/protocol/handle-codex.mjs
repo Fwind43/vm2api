@@ -18,10 +18,19 @@ import {
   isToolArgumentsError,
   toCodexResponses,
 } from './codex-convert.mjs'
-import { extraFromCodexHeaders, codexQuotaPark, CODEX_DEFAULT_PARK_MS } from './codex-usage.mjs'
+import {
+  extraFromCodexHeaders,
+  codexCreditsFromHeaders,
+  codexQuotaPark,
+  CODEX_DEFAULT_PARK_MS,
+} from './codex-usage.mjs'
 import { extractOpenaiUsage, openaiAnthropicUsageFromExtract, disjointOpenaiUsage } from './openai-usage.mjs'
 import { streamCodexKernel } from '../transport/codex-kernel-client.mjs'
-import { ensureCodexKernel, writeCodexKernelConfig } from '../transport/codex-kernel-supervisor.mjs'
+import {
+  codexKernelRequestOptions,
+  ensureCodexKernel,
+  writeCodexKernelConfig,
+} from '../transport/codex-kernel-supervisor.mjs'
 import { isLocalEgressProxy } from '../vm/egress.mjs'
 import { vmNodeId } from '../cluster/placement.mjs'
 import { hostProxyUrlForVm } from '../vm/slot-host.mjs'
@@ -37,6 +46,7 @@ import {
 } from './codex-models.mjs'
 import { orderCodexSessionSlots, codexSlotAllowsModel, isCodexFailoverError } from '../pool/codex-slot-pool.mjs'
 import {
+  holdOpenAIAccount,
   reportOpenAIAttempt,
   tryAcquireOpenAISlot,
   waitForOpenAICapacity,
@@ -134,6 +144,45 @@ function firstUserIdentityFromCodex(body = {}) {
   return extractFirstUserIdentity(body?.messages) || String(body?.prompt || '')
 }
 
+/** Codex failover shares the Claude pool's attempt budget. */
+export function codexFailoverBudget(routing = {}) {
+  const failover = routing?.failover || {}
+  const attempts = Number(failover.max_total_attempts)
+  const switches = Number(failover.max_account_switches)
+  const sameRetries = Number(failover.max_same_account_retries)
+  return {
+    maxAttempts: Number.isFinite(attempts) && attempts > 0 ? Math.min(64, Math.floor(attempts)) : 12,
+    maxSwitches: Number.isFinite(switches) && switches >= 0 ? Math.min(63, Math.floor(switches)) : 3,
+    maxSameAccountRetries: Number.isFinite(sameRetries) && sameRetries >= 0 ? Math.min(16, Math.floor(sameRetries)) : 3,
+  }
+}
+
+/** Same-account retries are only useful for transient failures; auth and quota errors switch seats. */
+export function isRetryableSameCodexAccount(
+  result,
+  { headersSent = false, conversionError = null, signal = null } = {},
+) {
+  if (!result || result.ok === true || result.committed === true || headersSent || conversionError) return false
+  if (signal?.aborted) return false
+  const status = Number(result.status) || 0
+  const code = String(result.body?.error?.code || result.error_code || '')
+  const message = String(result.body?.error?.message || result.error || '')
+  if (
+    /content_policy|refusal|usage_policy|guard|tool_arguments_mismatch|upstream_protocol_error/i.test(
+      `${code} ${message}`,
+    )
+  )
+    return false
+  if (result.transportError === true || status === 0) return true
+  if (status === 408) return true
+  if (status === 500 || status === 502 || status === 503 || status === 504) {
+    return (
+      code === '' || /server_error|provider_error|upstream_error|overloaded_error|internal_error|transport/i.test(code)
+    )
+  }
+  return false
+}
+
 function applyCodexRebuildBody(body, sessionId, mode) {
   const out = { ...body }
   if (mode !== 'rebuild') return out
@@ -219,15 +268,17 @@ function ingestCodexHop(projectRoot, vmId, result, now = Date.now(), policy = nu
   const headers = result?.headers || {}
   const extra = extraFromCodexHeaders(headers, now)
   let limitedUntil = null
+  let quotaExceeded = false
   if (
     isCodexFailoverError(result) &&
     (Number(result?.status) === 429 || /usage_limit_reached/.test(String(result?.body?.error?.code || '')))
   ) {
     const park = extra ? codexQuotaPark(extra, now) : { limited: true, until: now + CODEX_DEFAULT_PARK_MS }
     limitedUntil = park.until || now + CODEX_DEFAULT_PARK_MS
+    quotaExceeded = String(result?.body?.error?.code || result?.error_code || '') === 'usage_limit_reached'
   }
-  if (!extra && !limitedUntil) return null
-  return persistCodexUsage(projectRoot, vmId, { headers, extra, limitedUntil, now, policy })
+  if (!extra && !limitedUntil && !codexCreditsFromHeaders(headers, now)) return null
+  return persistCodexUsage(projectRoot, vmId, { headers, extra, limitedUntil, quotaExceeded, now, policy })
 }
 
 function execFor(projectRoot, vm) {
@@ -248,6 +299,32 @@ export function isRetryableCodexTransport(result) {
   if (status === 0) return true
   if (status === 502 && /upstream_transport|worker_transport|transport/i.test(`${code} ${msg}`)) return true
   return /upstream_transport|worker_transport_error/i.test(code)
+}
+
+/**
+ * Short process-local hold for an account that just failed upstream. This is
+ * not the operator scheduling switch: it expires by itself and keeps the next
+ * request from spending another turn on the same dead 401 / rate-limited
+ * account. Committed streams and request-shaped errors are never parked.
+ */
+export function codexFailureHold(result, now = Date.now()) {
+  if (!result || result.ok === true || result.committed === true) return null
+  const status = Number(result.status) || 0
+  const code = String(result.body?.error?.code || result.error_code || '')
+  const message = String(result.body?.error?.message || result.error || '')
+  if (status === 400 || status === 422) return null
+  if (
+    /content_policy|refusal|usage_policy|guard|tool_arguments_mismatch|upstream_protocol_error/i.test(
+      `${code} ${message}`,
+    )
+  )
+    return null
+  if (status === 401) return { until: now + 5 * 60_000, reason: 'oauth_401' }
+  if (status === 403) return { until: now + 5 * 60_000, reason: 'permission_denied' }
+  if (status === 429) return { until: now + 60_000, reason: 'rate_limited' }
+  if (status === 408 || status >= 500) return { until: now + 30_000, reason: 'upstream_5xx' }
+  if (result.transportError === true || status === 0) return { until: now + 30_000, reason: 'transport_error' }
+  return null
 }
 
 /** Idle SOCKS / first hop 502 is retryable only before any SSE byte is committed. */
@@ -515,10 +592,16 @@ export async function handleCodexProtocol({
   }
   const deadline = Date.now() + codexWaitTimeoutMs(routing)
   const gone = clientGoneSignal(req, res)
+  const failoverBudget = codexFailoverBudget(routing)
+  const sameRetryDelay = Number(routing?.failover?.same_account_retry_delay_ms)
+  const sameRetryDelayMs =
+    Number.isFinite(sameRetryDelay) && sameRetryDelay >= 0 ? Math.min(10_000, sameRetryDelay) : 100
   logBag.via = 'codex-kernel'
   logBag.attempt_count = 0
   let last = null
   let hops = 0
+  let attempts = 0
+  let switches = 0
   let counted = false
   try {
     for (;;) {
@@ -539,6 +622,11 @@ export async function handleCodexProtocol({
         lease.release()
         pickOpts.excluded.add(admitted.vmId)
         continue
+      }
+      attempts += 1
+      if (attempts > failoverBudget.maxAttempts) {
+        lease.release()
+        break
       }
       if (!counted) {
         counted = true
@@ -583,7 +671,7 @@ export async function handleCodexProtocol({
       let attemptKind = 'failed'
       try {
         const localExit = isLocalEgressProxy(vm.proxy)
-        writeCfg(projectRoot, vm, {
+        const written = writeCfg(projectRoot, vm, {
           // Same rule as slot start: a node on local egress must leave through
           // that node's forwarder, not the control plane's deployment proxy.
           proxyUrl: localExit && !vmNodeId(vm) ? '' : hostProxyUrlForVm(vm),
@@ -606,7 +694,11 @@ export async function handleCodexProtocol({
             },
           }
           pickOpts.excluded.add(vm.id)
-          if (!res.headersSent) continue
+          switches += 1
+          if (!res.headersSent) {
+            if (switches > failoverBudget.maxSwitches || attempts >= failoverBudget.maxAttempts) break
+            continue
+          }
           stats.errors++
           logBag.error_code = 'codex_kernel_unavailable'
           return json(res, 503, last.body)
@@ -646,56 +738,83 @@ export async function handleCodexProtocol({
         const outboundHeaders = codexKernelHeaders(req.headers, outboundBody, session)
         if (captureOutbound) logBag.outbound_body = outboundBody
         logBag.outbound_headers = redactHeaders(outboundHeaders)
-        const result = await runCodexKernelHop({
-          hop,
-          args: {
-            exec: execFor(projectRoot, vm),
-            signal: gone.signal,
-            body: outboundBody,
-            reqHeaders: req.headers,
-            envelope: {
+        let hopEmitted = false
+        const runHop = () =>
+          runCodexKernelHop({
+            hop,
+            args: {
+              exec: execFor(projectRoot, vm),
+              signal: gone.signal,
               body: outboundBody,
-              headers: outboundHeaders,
-              stream: true,
-              session,
+              reqHeaders: req.headers,
+              envelope: {
+                body: outboundBody,
+                headers: outboundHeaders,
+                stream: true,
+                session,
+                options: { ...codexKernelRequestOptions(routing), installation_id: written?.installationId },
+              },
             },
-          },
-          onReasoningFallback: ({ body: retryBody }) => {
-            if (captureOutbound) logBag.outbound_body = retryBody
-          },
-          onEvent: async (line) => {
-            if (conversionError) return
-            const tier = serviceTierFromSseLine(line)
-            if (tier) responseServiceTier = tier
-            const seen = usageFromSseLine(line)
-            if (seen) streamedUsage = preferUsage(streamedUsage, seen)
-            if (!stream) {
-              chunks.push(line)
-              return
-            }
-            if (!res.headersSent) writeSSEHeaders(res)
-            if (protocol !== 'openai.responses') {
-              try {
-                const mapped =
-                  protocol === 'anthropic.messages'
-                    ? responsesSseToAnthropicEvents(line, anthropicSse)
-                    : responsesSseToChatChunk(line, 'codex', chatSse)
-                if (mapped) res.write(mapped)
-              } catch (error) {
-                if (error.code !== 'tool_arguments_mismatch') throw error
-                conversionError = { type: 'upstream_protocol_error', code: error.code, message: error.message }
-                res.write(
-                  protocol === 'anthropic.messages'
-                    ? `event: error\ndata: ${JSON.stringify({ type: 'error', error: conversionError })}\n\n`
-                    : `data: ${JSON.stringify({ error: conversionError })}\n\ndata: [DONE]\n\n`,
-                )
+            onReasoningFallback: ({ body: retryBody }) => {
+              if (captureOutbound) logBag.outbound_body = retryBody
+            },
+            onEvent: async (line) => {
+              hopEmitted = true
+              if (conversionError) return
+              const tier = serviceTierFromSseLine(line)
+              if (tier) responseServiceTier = tier
+              const seen = usageFromSseLine(line)
+              if (seen) streamedUsage = preferUsage(streamedUsage, seen)
+              if (!stream) {
+                chunks.push(line)
+                return
               }
-              return
-            }
-            const named = nameSseEvent(line)
-            if (named) res.write(named)
-          },
-        })
+              if (!res.headersSent) writeSSEHeaders(res)
+              if (protocol !== 'openai.responses') {
+                try {
+                  const mapped =
+                    protocol === 'anthropic.messages'
+                      ? responsesSseToAnthropicEvents(line, anthropicSse)
+                      : responsesSseToChatChunk(line, 'codex', chatSse)
+                  if (mapped) res.write(mapped)
+                } catch (error) {
+                  if (error.code !== 'tool_arguments_mismatch') throw error
+                  conversionError = { type: 'upstream_protocol_error', code: error.code, message: error.message }
+                  res.write(
+                    protocol === 'anthropic.messages'
+                      ? `event: error\ndata: ${JSON.stringify({ type: 'error', error: conversionError })}\n\n`
+                      : `data: ${JSON.stringify({ error: conversionError })}\n\ndata: [DONE]\n\n`,
+                  )
+                }
+                return
+              }
+              const named = nameSseEvent(line)
+              if (named) res.write(named)
+            },
+          })
+        let result = await runHop()
+        // A transient seat-local failure gets the same account up to N retries
+        // before the request spends a switch. 401/403/429 are never retried here:
+        // they are credential/account state and must move to another seat.
+        let sameAccountRetries = result?.transport_retried || result?.reasoning_history_retried ? 1 : 0
+        while (
+          sameAccountRetries < failoverBudget.maxSameAccountRetries &&
+          attempts < failoverBudget.maxAttempts &&
+          isRetryableSameCodexAccount(result, {
+            headersSent: res.headersSent || hopEmitted,
+            conversionError,
+            signal: gone.signal,
+          })
+        ) {
+          sameAccountRetries += 1
+          attempts += 1
+          hops += 1
+          logBag.attempt_count = hops
+          logBag.codex_same_account_retried = sameAccountRetries
+          await new Promise((resolve) => setTimeout(resolve, sameRetryDelayMs))
+          hopEmitted = false
+          result = await runHop()
+        }
         // The log and total duration share ingress time; pool scoring keeps hop TTFT.
         logBag.first_token_ms = Number.isFinite(result?.firstTokenAt)
           ? Math.max(0, result.firstTokenAt - requestStartedAt)
@@ -767,7 +886,9 @@ export async function handleCodexProtocol({
           return res.end()
         }
         reportOpenAIAttempt(vm.id, attemptKind, result?.ttftMs ?? null)
-        if (res.headersSent) {
+        const failureHold = codexFailureHold(result)
+        if (failureHold) holdOpenAIAccount(vm.id, failureHold)
+        if (res.headersSent || hopEmitted) {
           stats.errors++
           logBag.error_code = result?.body?.error?.code || 'codex_upstream'
           logBag.upstream_status = result?.status || 0
@@ -776,6 +897,8 @@ export async function handleCodexProtocol({
         if (isCodexFailoverError(result)) {
           pickOpts.excluded.add(vm.id)
           leaveSticky()
+          switches += 1
+          if (switches > failoverBudget.maxSwitches || attempts >= failoverBudget.maxAttempts) break
           continue
         }
         break

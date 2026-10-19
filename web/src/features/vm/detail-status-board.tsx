@@ -39,11 +39,13 @@ import {
   quotaWindowHint,
   ResetAt,
 } from '@/features/vm/detail-section-primitives'
+import type { VmTodayCounts } from '@/features/vm/detail-today'
 import { KernelFeatTags } from '@/features/vm/kernel-feat-tags'
 import { OpenaiPlanBadge } from '@/features/vm/openai-plan-badge'
 import { OpenaiQuotaPanel } from '@/features/vm/openai-quota-panel'
 import { proxyHealthOf } from '@/features/vm/proxy-health'
 import { RuntimeChip } from '@/features/vm/runtime-chip'
+import { VmMemoryBlock } from '@/features/vm/vm-memory-block'
 import { VmSchedulingBlock } from '@/features/vm/vm-scheduling'
 import { telemetryView } from './telemetry-policy'
 import { telemetryStatusLabel } from './telemetry-status'
@@ -62,6 +64,7 @@ type Props = {
   split: WeeklySplitSummary | null
   conc: ConcurrencyInfo
   rpm: RpmInfo | null
+  today: VmTodayCounts
 }
 
 type Verdict = {
@@ -169,6 +172,7 @@ export function VmStatusBoard(props: Props) {
     split,
     conc,
     rpm,
+    today,
   } = props
   const verdict = slotVerdict(vm, kernel, proxy)
   const proxyH = proxyHealthOf(vm, proxy)
@@ -355,7 +359,7 @@ export function VmStatusBoard(props: Props) {
                 )}
               </div>
               <div className='text-[11px] text-muted-foreground'>
-                {fmtNum(cost.req)} req
+                {fmtNum(today.requests)} req
               </div>
             </div>
             <div>
@@ -374,8 +378,9 @@ export function VmStatusBoard(props: Props) {
                 {proxyNamedLabel(proxy)}
               </span>
             </Field>
-            <div className='py-2'>
+            <div className='space-y-2 py-2'>
               <VmSchedulingBlock vm={vm} conc={conc} rpm={rpm} />
+              <VmMemoryBlock vm={vm} />
             </div>
             {isCodexVm(vm) ? null : (
               <>

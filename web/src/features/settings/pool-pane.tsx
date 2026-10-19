@@ -640,7 +640,6 @@ export function PoolPane({
           <Link2 className='size-3.5' aria-hidden /> 粘性设置
         </a>
       </div>
-
       <Dialog
         open={open !== null}
         onOpenChange={(next) => {
@@ -870,7 +869,7 @@ export function PoolPane({
                 <SliderSetting
                   id='failover-stream-idle'
                   label='流空闲超时'
-                  desc='上游流连续无事件超过此时长即断开；大文件 Write 会被上游整段缓冲，过短会误断。保存后各槽 kernel 会在没有请求时自动重启以应用新值。'
+                  desc='上游流连续无事件超过此时长即断开；大文件 Write 会被上游整段缓冲，过短会误断。未在面板设置时可用控制面环境变量 KIN_STREAM_IDLE_TIMEOUT（毫秒）。保存后各槽 kernel 会在没有请求时自动重启以应用新值。'
                   value={numOf(
                     failoverDraft,
                     'stream_idle_timeout_ms',

@@ -39,12 +39,29 @@ x-api-key: sk-vm-…
 | `POST` | `/v1/chat/completions` 或 `/chat/completions` | OpenAI Chat | OpenAI Chat / SSE |
 | `POST` | `/v1/completions` 或 `/completions` | OpenAI Completions | OpenAI Completions |
 | `POST` | `/v1/responses` 或 `/responses` | OpenAI Responses | OpenAI Responses |
+| `GET` + Upgrade | `/v1/responses` 或 `/responses` | Responses WebSocket | JSON `response.*` 帧，不包 SSE |
 | `GET` | `/v1/models` | — | 本地模型策略目录 |
 | `GET` | `/health` · `/` · `/v1/meta` | 无鉴权 | 能力 / 限制 / 计数 |
 
 上游 hop **永远** `stream: true`。客户端 `stream: true` 收 SSE；`stream: false` 或 `x-kin-delivery: verified` 由网关聚合成 JSON。
 
 别名路径（无 `/v1` 前缀）与上表相同处理函数。
+
+## Responses WebSocket
+
+用相同 Bearer API key 对 `GET /v1/responses` 发起标准 WebSocket Upgrade，然后发送文本帧：
+
+```json
+{"type":"response.create","model":"gpt-5.4","input":[{"role":"user","content":"hi"}]}
+```
+
+`stream` 可省略，显式指定时必须为 `true`。每轮走既有鉴权、密钥范围、限流、调度、用量与日志链路；响应为独立 JSON `response.*` 事件，不带 `event:` / `data:` 或 `[DONE]`。同连接串行执行，接收队列最多 32 条，累计排队字节还受现有请求体上限约束；超过帧/字节上限关闭 1009，队列条数超限关闭 1008，二进制帧关闭 1003。客户端断开会取消当前 hop。普通 GET 未带 Upgrade 返回 426。
+
+同连接已完成响应的 `previous_response_id` 会展开为原输入与完整输出（含 reasoning / tool items）再执行，不依赖上游保留旧 WS。回放缓存最多 32 条 / 8 MiB。未知、已淘汰或另一连接的 ID 返回 `400 previous_response_not_found`，要求携带完整上下文重发；不会假装原生跨连接续接。当前只接受 `response.create`，未实现的控制事件返回明确协议错误，不伪装已转发或成功。
+
+`websocket.enabled` 和 `codex.websocket.enabled` 必须同时为 true；任一关闭，新握手返回 `403 websocket_disabled`，已有连接的后续 create 也会复核。HTTP/SSE 不关闭，上游强制 HTTP。仅把 `codex.upstream_transport` 设为 `http` 时，入站 WS 仍可用，但每轮走 HTTP/SSE 上游；依赖 WS 的 `generate:false` 预热返回 `400 unsupported_prewarm`，零上游执行。配置入口见 [OpenAI 传输与隐私](PANEL_API.md#openai-传输与隐私)。
+
+握手后的失败形态为 `{"type":"error","status":400,"error":{"type":"invalid_request_error","code":"…","message":"…"}}`，保留已确认的真实错误；没有终态时报告 `incomplete_response`，不合成 `response.completed`。
 
 ## 公共请求头
 
@@ -53,7 +70,7 @@ x-api-key: sk-vm-…
 | `content-type: application/json` | 必填 |
 | `x-session-id` / `x-conversation-id` / `x-claude-code-session-id` | sticky 键（见 `routing.sticky`） |
 | 交付模式 `verified` | 缓冲到 `message_stop` 再回放 |
-| 缓存 TTL `1h` | 出站 cache 默认 1h；`x-kin-cache-ttl: 5m` 可降到 5m |
+| 缓存 TTL `1h` | Node 新增点的缺省值；`x-kin-cache-ttl: 5m` 参与首次会话选择，不覆盖 native 透传 caller / 模板显式 TTL |
 | 调试开关 | 单请求日志模式 |
 | 钉槽（仅 master） | 虚拟机测试 loopback |
 | `X-Request-ID` | 原样回写响应头 |
@@ -81,6 +98,8 @@ curl -sS http://127.0.0.1:8787/v1/messages \
 非官方入站会被改写成配置选定的 persona system 再发给上游；**回包不带改写后的 system**。`persona_preset=official` 保留 billing、identity、调用方 agent prompt（若有）和调用方 system；`persona_preset=official_full` 才固定追加完整 Claude Code agent prompt。非官方 `usage` 按「没有 persona system、没有注入 tools」估算。官方 Claude Code 四闸全过则体不改、usage 不藏。
 
 支持的 Messages 字段原样进入清洗层：`system`、`tools`、`tool_choice`、`thinking`、`output_config`、`metadata`、`stop_sequences`、图片块、`cache_control`。非法 `role` 会洗掉。OpenAI 形态 tools 出现在本口时先转成 Anthropic tools，但仍判非官方。
+
+native cli-hop 开启官方家族透传时，调用方 `cache_control` 的位置、显式 TTL 与缺失 TTL 保留。超过四个 breakpoint、thinking 上打点、非法 TTL，或 `5m`（含缺失 TTL）之后出现 `1h`，返回 `400 invalid_cache_control`，不静默裁剪或降级、不执行上游。非透传仍按协议重写规则生成自产点；kernel 不再替前置层修复 TTL 顺序。
 
 ### Sonnet 5.5 兼容边界
 
@@ -198,6 +217,26 @@ curl -sS http://127.0.0.1:8787/v1/usage -H "Authorization: Bearer $KEY"
 套餐判定只认成功且完整的官方 usage：必须有 5h、7d，并能确定 Fable 7d 是否存在；有 Fable 7d 即 Max，没有即 Pro。失败、scope 不足、只有 5h、CLI 文本不完整都不改套餐。未知但有票的账号在面板显示为“待探测/未确认”，不是第三套餐。
 
 
+
+### 周期额度查询的重置后错峰
+
+`PUT /api/panel/routing` 可设置（沿用面板鉴权；不是手动 `/probe` 请求体）：
+
+```json
+{
+  "usage_probe": {
+    "enabled": true,
+    "reset_delay_sec": 120,
+    "reset_jitter_sec": 600
+  }
+}
+```
+
+两项均默认 `0`、范围 `0`–`3600` 秒，省略时保留旧行为。对已到期且带有效重置时间的 Extra `5h` 窗口，周期查询的最早时间为 `reset + reset_delay_sec + 每账号稳定偏移`；偏移在 `0`–`reset_jitter_sec` 内，由账号身份和该轮 reset 确定，重复 tick、进程重启及列表重排不会重新抽签。上例为重置后 120–720 秒；实际执行仍受 `interval_sec` 的 tick 粒度、并发、单飞及退避限制，不保证每个账号不同秒执行。等待项在 `GET /api/panel/usage-probe` 的快照中显示 `reason: "reset_probe_delay"` 和 `next_probe_at`（最早时间，不是预约保证）。
+
+这只调整**周期额度探测链路的执行时间**，不新增探测：现有链路以官方 `GET /api/oauth/usage` 查询为主，满足套餐复核条件时仍可能执行现有 Fable Messages 探测；本改动不改变这些条件。没有有效已到期 5h reset 的未采样账号、仅 7d 到期或无有效 5h reset 的账号保留原逻辑；已有 `last_probe.ok === true` 且探测时间不早于本轮 reset 的账号不再被旧 reset 延迟，仅由真实流量更新的 `headers.sampled_at` 不触发该豁免。官方 usage 退避优先，主动/过期样本和套餐复核路径不会绕过等待。主动调用 `POST /api/panel/usage-probe` 同样运行周期规则；手动 `POST /api/panel/probe`、事件 `probeNow`、真实用户流量及独立 Messages 健康检查不受此延迟影响。
+
+因此，这些设置**不保证上游 5h 计费/额度窗口错开**：官方 usage GET 是否会开启窗口没有得到验证，既有 Fable Messages、真实流量及独立 Messages 健康检查也可能触发新窗口。延迟会让面板/额度恢复信息更晚刷新；需要即时查询时使用手动 `/probe`。当前仅提供 routing/API 配置，不新增面板控件。
 
 ## 健康
 

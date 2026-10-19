@@ -24,6 +24,7 @@ import {
   resolveInferenceEngine,
   resolveKernelDataplane,
   normalizeSessionSlots,
+  normalizeSessionIdleTtlSeconds,
   resolveSessionSlots,
   resolveSlotPersonaPreset,
 } from '../vm/slot-engine.mjs'
@@ -86,10 +87,10 @@ import {
 } from '../identity/persona-template.mjs'
 import { PERSONA_STANDING_MAX } from '../identity/crs-persona.mjs'
 import { MESSAGES_BREAKPOINT_MODES } from '../protocol/cache-ttl.mjs'
-import { normalizeCodexRouting } from '../protocol/codex-route.mjs'
+import { normalizeCodexRouting, normalizeInferenceWebsocket } from '../protocol/codex-route.mjs'
 import { effectiveOpenAIPolicy, normalizeOpenAIQuotaPolicy } from '../pool/openai-quota-policy.mjs'
 import { openAIRuntimeSignals } from '../pool/openai-account-runtime.mjs'
-import { normalizeVmConfig } from '../vm/machine-spec.mjs'
+import { normalizeVmConfig, memoryMiB } from '../vm/machine-spec.mjs'
 import { runtimeKind } from '../vm/runtime-kind.mjs'
 
 export function ok(data, meta) {
@@ -181,6 +182,104 @@ export function publicVmBootView(vm) {
     schedule_disabled_reason: vm.schedule_disabled_reason || null,
     runtime_type: vm.runtime_type || runtimeKind(vm),
     machine: vm.machine || null,
+  }
+}
+
+function presentText(value) {
+  if (value == null) return null
+  const s = String(value).trim()
+  return s ? s : null
+}
+
+function presentList(value) {
+  if (Array.isArray(value)) {
+    const parts = value.map((item) => presentText(item)).filter(Boolean)
+    return parts.length ? parts.join(', ') : null
+  }
+  return presentText(value)
+}
+
+function presentInt(value) {
+  const n = Number(value)
+  if (!Number.isFinite(n) || n < 0) return null
+  return Math.round(n)
+}
+
+function presentBytes(value) {
+  const n = Number(value)
+  if (!Number.isFinite(n) || n < 0) return null
+  return Math.round(n)
+}
+
+function publicDmi(hardware, smbios) {
+  const nested = hardware?.dmi && typeof hardware.dmi === 'object' ? hardware.dmi : {}
+  const machine = smbios && typeof smbios === 'object' ? smbios : {}
+  const pick = (key, flat) => presentText(nested[key]) || presentText(hardware?.[flat]) || presentText(machine[key])
+  const out = {
+    manufacturer: pick('manufacturer', 'dmi_manufacturer'),
+    product: pick('product', 'dmi_product'),
+    version: pick('version', 'dmi_version'),
+    family: pick('family', 'dmi_family'),
+    serial: pick('serial', 'dmi_serial'),
+    uuid: pick('uuid', 'dmi_uuid'),
+  }
+  return Object.values(out).some(Boolean) ? out : null
+}
+
+/** Sanitized guest facts for panel VM projections. Never copies tokens, IDs, or host paths. */
+export function publicPhysicalFeatures(vm) {
+  const empty = {
+    observed_at: null,
+    runtime_type: null,
+    hostname: null,
+    os_id: null,
+    os_pretty: null,
+    kernel_release: null,
+    arch: null,
+    machine_id_present: false,
+    timezone: null,
+    locale: null,
+    cpu_model: null,
+    cpu_cores: null,
+    memory_bytes: null,
+    root_disk: null,
+    mac: null,
+    dmi: null,
+    shell: null,
+    package_managers: null,
+    runtimes: null,
+  }
+  if (!vm || typeof vm !== 'object') return empty
+  const fp = vm.fingerprint && typeof vm.fingerprint === 'object' ? vm.fingerprint : {}
+  const hw = fp.hardware && typeof fp.hardware === 'object' ? fp.hardware : {}
+  const machine = vm.machine && typeof vm.machine === 'object' ? vm.machine : {}
+  const runtime = vm.runtime && typeof vm.runtime === 'object' ? vm.runtime : {}
+  const specMiB = machine.memory ? memoryMiB(machine.memory) : 0
+  return {
+    observed_at:
+      presentText(hw.observed_at) || presentText(fp.collected_at) || presentText(runtime.identity_collected_at),
+    runtime_type: vm.runtime_type || runtimeKind(vm) || null,
+    hostname: presentText(fp.hostname),
+    os_id: presentText(fp.os_id),
+    os_pretty: presentText(fp.os_pretty),
+    kernel_release: presentText(fp.guest_kernel_release) || presentText(fp.kernel_release),
+    arch: presentText(fp.stainless_arch) || presentText(fp.arch),
+    machine_id_present: !!(
+      presentText(fp.guest_machine_id) ||
+      presentText(fp.machine_id) ||
+      presentText(hw.machine_id)
+    ),
+    timezone: presentText(fp.timezone) || presentText(vm.timezone),
+    locale: presentText(fp.locale) || presentText(vm.locale),
+    cpu_model: presentText(hw.cpu_model) || presentText(machine.cpu_model),
+    cpu_cores: presentInt(hw.cpu_cores) ?? presentInt(machine.vcpus),
+    memory_bytes: presentBytes(hw.memory_bytes) ?? (specMiB > 0 ? specMiB * 1024 * 1024 : null),
+    root_disk: presentText(hw.root_disk) || presentText(machine.disk_serial),
+    mac: presentText(hw.mac) || presentText(machine.mac),
+    dmi: publicDmi(hw, machine.smbios),
+    shell: presentList(hw.shell) || presentList(fp.shell),
+    package_managers: presentList(hw.package_managers) || presentList(fp.package_managers),
+    runtimes: presentList(hw.runtimes) || presentList(fp.runtimes),
   }
 }
 
@@ -371,6 +470,9 @@ export function validatePersonaRoutingPatch(body = {}) {
   }
   if (compat.official_cc_passthrough != null && typeof compat.official_cc_passthrough !== 'boolean') {
     problems.push('official_cc_passthrough 必须是布尔')
+  }
+  if (Object.prototype.hasOwnProperty.call(compat, 'cch_enabled') && typeof compat.cch_enabled !== 'boolean') {
+    problems.push('cch_enabled 必须是布尔')
   }
   if (compat.cache_breakpoints != null) {
     const bp = compat.cache_breakpoints
@@ -970,6 +1072,7 @@ export async function buildProbeOne({
       },
       quota: result.quota,
       reset_credits: result.reset_credits || null,
+      credits: result.credits || null,
       windows: result.windows || [],
       probed_at: result.fetched_at || new Date().toISOString(),
       ok: true,
@@ -1288,6 +1391,18 @@ export function buildUsage({ accountQuota, cfg, requestLog = null }) {
   })
 }
 
+function presentCompatibility(compat) {
+  const out = compat && typeof compat === 'object' && !Array.isArray(compat) ? { ...compat } : {}
+  out.cch_enabled = out.cch_enabled !== false
+  return out
+}
+
+function presentInference(inference) {
+  const out = inference && typeof inference === 'object' && !Array.isArray(inference) ? { ...inference } : {}
+  out.session_idle_ttl_seconds = normalizeSessionIdleTtlSeconds(out.session_idle_ttl_seconds)
+  return out
+}
+
 export function buildRouting({ routingConfig, stickyRouter }) {
   const tiers = normalizeTiers(routingConfig?.tiers, routingConfig?.quota, routingConfig?.concurrency)
   return ok({
@@ -1298,8 +1413,9 @@ export function buildRouting({ routingConfig, stickyRouter }) {
     logging: routingConfig?.logging || {},
     pool: normalizePoolRouting(routingConfig?.pool),
     failover: routingConfig?.failover || {},
-    compatibility: routingConfig?.compatibility || {},
-    inference: routingConfig?.inference || {},
+    compatibility: presentCompatibility(routingConfig?.compatibility),
+    inference: presentInference(routingConfig?.inference),
+    websocket: normalizeInferenceWebsocket(routingConfig?.websocket),
     codex: normalizeCodexRouting(routingConfig?.codex),
     official_cc: normalizeOfficialCcConfig(routingConfig?.official_cc),
     health_probe: normalizeHealthProbeConfig(routingConfig?.health_probe),
@@ -1834,6 +1950,7 @@ function enrichVm(v, accountQuota, active, extras = {}) {
     status_7d_oi: isCodex ? null : q.status_7d_oi,
     codex_usage: v.codex_usage || null,
     reset_credits: isCodex ? v.reset_credits || v.codex?.reset_credits || null : null,
+    codex_credits: isCodex ? v.codex_credits || v.codex?.credits || null : null,
     claude_reset_credits: isCodex ? null : v.claude_reset_credits || null,
     plan_type: isCodex ? v.plan_type || null : null,
     ...(q.weekly_split ? { weekly_split: q.weekly_split } : {}),
@@ -1900,6 +2017,7 @@ function enrichVm(v, accountQuota, active, extras = {}) {
       : (u5 != null && gateZone(u5, safety, quotaGate) !== GATE_OPEN) ||
         (u7 != null && gateZone(u7, weeklySafety, quotaGate) !== GATE_OPEN),
     fingerprint: v.fingerprint || null,
+    physical_features: publicPhysicalFeatures(v),
     runtime: v.runtime || null,
     ip: v.ip || v.runtime?.ip || null,
     pid: v.pid || v.runtime?.pid || null,

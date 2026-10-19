@@ -5,6 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import {
   shouldReplaceSlotContainer,
+  ensureSlotImage,
   proxyEndpointFromUrl,
   proxyEndpointFromVm,
   readWorkerProxyEndpoint,
@@ -151,6 +152,32 @@ test('kvm runner on the wrong egress network is recreated', (t) => {
   assert.equal(slotWorkerNeedsRecreate(existing, vm, paths), true)
 })
 
+test('crash-looping kvm runner is replaced and recreated on reload even on the right network', (t) => {
+  const runDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-reload-kvm-loop-'))
+  t.after(() => fs.rmSync(runDir, { recursive: true, force: true }))
+  const vm = { id: 'vm-08', runtime: { type: 'kvm' }, proxy: { id: 'px-a' } }
+  const paths = { kernelSocket: path.join(runDir, 'kernel.sock') }
+  const existing = { running: false, restarting: true, networkMode: 'kin-eg-px-a', runtime: 'kvm', image: 'img' }
+  assert.equal(slotWorkerNeedsRecreate(existing, vm, paths), true)
+  assert.equal(
+    shouldReplaceSlotContainer({ existing, recreate: false, network: 'kin-eg-px-a', image: 'img', runtime: 'kvm' }),
+    true,
+  )
+})
+
+test('ensureSlotImage refreshes a cached tag and falls back to it when the registry is unreachable', () => {
+  const calls = []
+  const registry = (pullOk) => (argv) => {
+    calls.push(argv.slice(0, 3).join(' '))
+    return { ok: argv[1] === 'pull' ? pullOk : true }
+  }
+  assert.equal(ensureSlotImage('debian-12', { runtime: 'kvm', run: registry(true) }).action, 'pulled')
+  assert.deepEqual(calls, ['docker pull ghcr.io/dofastted/kin-kvm-debian:12'])
+  calls.length = 0
+  assert.equal(ensureSlotImage('debian-12', { runtime: 'kvm', run: registry(false) }).action, 'present')
+  assert.deepEqual(calls, ['docker pull ghcr.io/dofastted/kin-kvm-debian:12', 'docker image inspect'])
+})
+
 test('unbound slot does not recreate for a missing desired network', (t) => {
   const runDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-reload-nopx-'))
   t.after(() => fs.rmSync(runDir, { recursive: true, force: true }))
@@ -166,12 +193,12 @@ test('unbound slot does not recreate for a missing desired network', (t) => {
 test('reloadSlotWorker recreates on network mismatch before the KVM restart path', () => {
   const src = fs.readFileSync(new URL('../../src/lib/vm/vm-runtime.mjs', import.meta.url), 'utf8')
   const reload = src.slice(
-    src.indexOf('export function reloadSlotWorker'),
+    src.indexOf('export async function reloadSlotWorker'),
     src.indexOf('export function slotKernelAlive'),
   )
   assert.match(reload, /slotWorkerNeedsRecreate\(existing, vm, paths\)/)
   assert.ok(
-    reload.indexOf('slotWorkerNeedsRecreate') < reload.indexOf('isKvmRuntime(vm)'),
+    reload.indexOf('slotWorkerNeedsRecreate') < reload.indexOf('if (isKvmRuntime(vm)) {'),
     'network recreate must run before systemctl restart',
   )
 })
@@ -237,14 +264,14 @@ test('isSlotProxyDesynced compares worker.json to vm.json', () => {
   fs.rmSync(root, { recursive: true, force: true })
 })
 
-test('reload writes transparent egress for local exit without a SOCKS url', () => {
+test('reload writes transparent egress for local exit without a SOCKS url', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-reload-local-'))
   const vm = {
     id: 'vm-09',
     proxy_cli_enabled: true,
     proxy: { id: 'px-local', scheme: 'local', host: 'local', port: 0, url: null },
   }
-  const result = reloadSlotWorker(vm, root, { routing: {} })
+  const result = await reloadSlotWorker(vm, root, { routing: {} })
   const doc = JSON.parse(fs.readFileSync(path.join(root, 'vms', 'vm-09', 'run', 'worker.json'), 'utf8'))
   assert.equal(doc.proxy_url, '')
   assert.equal(doc.proxy_required, false)
@@ -314,7 +341,7 @@ test('a GPT slot container is live without kernel.sock, and an old kin-kernel on
   assert.equal(slotWorkerNeedsRecreate({ running: true, networkMode: null }, { id: 'vm-03' }, paths), false)
 })
 
-test('writeWorkerFiles and startVmRuntime use defaults when routing.json is absent', () => {
+test('writeWorkerFiles and startVmRuntime use defaults when routing.json is absent', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-no-routing-'))
   const prev = process.env.KIN_ROUTING_FILE
   delete process.env.KIN_ROUTING_FILE
@@ -326,14 +353,7 @@ test('writeWorkerFiles and startVmRuntime use defaults when routing.json is abse
     }
     const paths = writeWorkerFiles(vm, root, { transparent: true })
     assert.ok(fs.existsSync(paths.config))
-    let thrown = null
-    let result
-    try {
-      result = startVmRuntime(vm, root)
-    } catch (error) {
-      thrown = error
-    }
-    assert.equal(thrown, null)
+    const result = await startVmRuntime(vm, root)
     assert.ok(result)
     assert.equal(/Routing config/.test(String(result?.error || '')), false)
   } finally {

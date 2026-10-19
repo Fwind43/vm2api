@@ -66,13 +66,14 @@ export const CODEX_DEFAULT_PARK_MS = 60_000
 /**
  * Park verdict for a slot: a window at its cap with a future reset, or an
  * explicit `usage_limit_reached`, means the credential is spent until the
- * soonest window reset.
+ * soonest window reset. `waiveWindowCaps` (spendable credits) ignores the
+ * window caps; an explicit park still holds.
  */
-export function codexQuotaPark(extra = {}, now = Date.now()) {
+export function codexQuotaPark(extra = {}, now = Date.now(), { waiveWindowCaps = false } = {}) {
   const limits = normalizeCodexLimits(extraToCodexSnapshot(extra))
   let until = null
   let liveCap = false
-  for (const key of ['5h', '7d']) {
+  for (const key of waiveWindowCaps ? [] : ['5h', '7d']) {
     const used = num(limits[`used_${key}_percent`])
     const resetMs = Date.parse(limits[`reset_${key}_at`] || '')
     if (used == null || used < 100) continue
@@ -85,6 +86,69 @@ export function codexQuotaPark(extra = {}, now = Date.now()) {
   if (manualLive && (until == null || manual < until)) until = manual
   if (liveCap && until == null && !Number.isFinite(manual)) until = now + CODEX_DEFAULT_PARK_MS
   return { limited: until != null, until }
+}
+
+/**
+ * How long a credits reading may waive the window caps. Each Responses reply
+ * refreshes it, so only an idle or parked slot ages out.
+ */
+export const CODEX_CREDITS_TTL_MS = 10 * 60_000
+
+function flag(value) {
+  if (typeof value === 'boolean') return value
+  const text = String(value ?? '')
+    .trim()
+    .toLowerCase()
+  if (text === 'true' || text === '1') return true
+  if (text === 'false' || text === '0') return false
+  return null
+}
+
+function creditBalance(value) {
+  if (typeof value === 'string') return value.trim() || null
+  return typeof value === 'number' && Number.isFinite(value) ? String(value) : null
+}
+
+/**
+ * ChatGPT credits (`/wham/usage` `credits`, or `x-codex-credits-*` headers).
+ * Both flags are required, as in the Codex CLI. `balance` stays a string so a
+ * long decimal is never rounded through a float.
+ */
+export function normalizeCodexCredits(raw, now = Date.now()) {
+  if (!raw || typeof raw !== 'object') return null
+  const hasCredits = flag(raw.has_credits ?? raw.hasCredits)
+  const unlimited = flag(raw.unlimited)
+  if (hasCredits == null || unlimited == null) return null
+  return {
+    has_credits: hasCredits,
+    unlimited,
+    balance: creditBalance(raw.balance),
+    fetched_at: new Date(now).toISOString(),
+  }
+}
+
+export function codexCreditsFromHeaders(headers = {}, now = Date.now()) {
+  const h = lowerHeaders(headers)
+  if (!h) return null
+  return normalizeCodexCredits(
+    {
+      has_credits: h['x-codex-credits-has-credits'],
+      unlimited: h['x-codex-credits-unlimited'],
+      balance: h['x-codex-credits-balance'],
+    },
+    now,
+  )
+}
+
+/**
+ * A fresh reading that says the account can still buy past its 5h/7d windows.
+ * It only earns the slot another try; the upstream 429 stays the authority.
+ */
+export function hasSpendableCodexCredits(vm, now = Date.now()) {
+  const credits = vm?.codex?.credits ?? vm?.codex_credits
+  const fetchedAt = Date.parse(credits?.fetched_at || '')
+  if (!Number.isFinite(fetchedAt) || now - fetchedAt > CODEX_CREDITS_TTL_MS) return false
+  return credits.unlimited === true || credits.has_credits === true
 }
 
 function lowerHeaders(headers) {
@@ -100,11 +164,19 @@ function lowerHeaders(headers) {
 export function extraToCodexSnapshot(extra = {}) {
   if (!extra || typeof extra !== 'object') return emptySnapshot()
   return {
-    primary_used_percent: num(extra.codex_primary_used_percent ?? extra.codex_7d_used_percent),
+    primary_used_percent: num(
+      Object.hasOwn(extra, 'codex_primary_used_percent')
+        ? extra.codex_primary_used_percent
+        : extra.codex_7d_used_percent,
+    ),
     primary_reset_after_seconds: int(extra.codex_primary_reset_after_seconds ?? extra.codex_7d_reset_after_seconds),
     primary_window_minutes: int(extra.codex_primary_window_minutes ?? extra.codex_7d_window_minutes),
     primary_reset_at: extra.codex_primary_reset_at || extra.codex_7d_reset_at || null,
-    secondary_used_percent: num(extra.codex_secondary_used_percent ?? extra.codex_5h_used_percent),
+    secondary_used_percent: num(
+      Object.hasOwn(extra, 'codex_secondary_used_percent')
+        ? extra.codex_secondary_used_percent
+        : extra.codex_5h_used_percent,
+    ),
     secondary_reset_after_seconds: int(extra.codex_secondary_reset_after_seconds ?? extra.codex_5h_reset_after_seconds),
     secondary_window_minutes: int(extra.codex_secondary_window_minutes ?? extra.codex_5h_window_minutes),
     secondary_reset_at: extra.codex_secondary_reset_at || extra.codex_5h_reset_at || null,

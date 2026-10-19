@@ -12,13 +12,14 @@ import {
   hasRefreshPresence,
   clearVmQuotaRestriction,
   markVmRestriction,
+  expiresAtToMs,
 } from '../oauth/oauth-credentials.mjs'
 import { isManualScheduleLocked } from '../pool/schedule-policy.mjs'
-import { isLeftoverQuotaScheduleOff } from '../pool/availability.mjs'
+import { isCredentialRefreshFailed, isLeftoverQuotaScheduleOff } from '../pool/availability.mjs'
 import { manualScheduleLevelOf, parseScheduleLevelInput } from '../pool/credential-weight.mjs'
 import { vmQuotaOverrideOf } from '../pool/vm-quota-override.mjs'
 import { activeHoursOf, parseActiveHoursInput } from '../pool/active-hours.mjs'
-import { normalizeOwnerId, vmOriginOf } from '../admin/resource-owner.mjs'
+import { normalizeOwnerId, vmOriginOf, vmOwnerId, VM_ORIGIN } from '../admin/resource-owner.mjs'
 import { isCodexVm, normalizeVmKind } from './vm-kind.mjs'
 import { canClaudeResetCredits } from '../oauth/credential-mode.mjs'
 import { validTimezone } from '../core/timezone.mjs'
@@ -26,7 +27,9 @@ import {
   extraFromCodexHeaders,
   extraToCodexSnapshot,
   buildCodexUsageView,
+  codexCreditsFromHeaders,
   codexQuotaPark,
+  hasSpendableCodexCredits,
 } from '../protocol/codex-usage.mjs'
 
 import { summarizeCodexSlot } from './codex-slot.mjs'
@@ -164,6 +167,7 @@ export function summarizeVm(vm, projectRoot = null, routing = null) {
           }
         : null,
     reset_credits: codex?.reset_credits || null,
+    codex_credits: codex?.credits || null,
     plan_type: codex?.plan_type || null,
     claude_reset_credits: kind.kind === 'codex' ? null : vm.claude_reset_credits || null,
   }
@@ -201,7 +205,7 @@ export function persistAccountTier(projectRoot, vmId, tier, { source = null } = 
 export function persistCodexUsage(
   projectRoot,
   vmId,
-  { headers, extra, limitedUntil, now = Date.now(), policy = null } = {},
+  { headers, extra, limitedUntil, quotaExceeded = false, now = Date.now(), policy = null } = {},
 ) {
   if (!projectRoot || !vmId) return null
   const file = path.join(projectRoot, 'vms', `${vmId}.json`)
@@ -209,11 +213,28 @@ export function persistCodexUsage(
   const vm = JSON.parse(fs.readFileSync(file, 'utf8'))
   vm.codex = { ...(vm.codex || {}) }
   const fromHeaders = extraFromCodexHeaders(headers || {}, now)
-  const merged = { ...(vm.codex.extra || {}), ...(fromHeaders || {}), ...(extra || {}) }
+  const cached = { ...(vm.codex.extra || {}) }
+  if (quotaExceeded) {
+    // The error proves exhaustion, not which window or its percentage. Drop
+    // cached below-cap readings (including aliases) instead of inventing 100%.
+    // Keep known caps so a headerless error cannot release an existing limit.
+    // Fresh response measurements below are authoritative, even below 100%.
+    for (const role of ['primary', 'secondary', '5h', '7d']) {
+      const key = `codex_${role}_used_percent`
+      if (Object.hasOwn(cached, key) && !(Number(cached[key]) >= 100)) cached[key] = null
+    }
+  }
+  const merged = { ...cached, ...(fromHeaders || {}), ...(extra || {}) }
   if (limitedUntil) {
     merged.codex_limited_until = new Date(limitedUntil).toISOString()
+    // The refusal outranks any credits reading until a newer one arrives.
+    delete vm.codex.credits
   } else {
-    const parked = codexQuotaPark({ ...merged, codex_limited_until: null }, now)
+    const credits = codexCreditsFromHeaders(headers || {}, now)
+    if (credits) vm.codex.credits = credits
+    const parked = codexQuotaPark({ ...merged, codex_limited_until: null }, now, {
+      waiveWindowCaps: hasSpendableCodexCredits(vm, now),
+    })
     if (parked.limited) merged.codex_limited_until = new Date(parked.until).toISOString()
     else delete merged.codex_limited_until
   }
@@ -443,7 +464,14 @@ export function vmHasClaudeCredential(vm) {
  */
 export function vmHasSchedulableCredential(vm, projectRoot = null) {
   if (!vm) return false
-  if (!isCodexVm(vm)) return vmHasClaudeCredential(vm)
+  if (!isCodexVm(vm)) {
+    if (!vmHasClaudeCredential(vm)) return false
+    // An expired access token with a recorded refresh failure is not a live
+    // credential: the worker cannot rotate it, every hop will answer 401.
+    const expMs = expiresAtToMs(vm.claude?.expires_at)
+    if (expMs && expMs > Date.now()) return true
+    return !isCredentialRefreshFailed({ vm, now: Date.now() })
+  }
   const codex = summarizeCodexSlot(projectRoot, vm)
   return !!(codex?.has_token || codex?.has_refresh)
 }
@@ -487,6 +515,57 @@ export function setVmSchedulable(
   }
   atomicWriteJson(file, vm)
   return summarizeVm(vm)
+}
+export const KERNEL_UPDATE_HOLD = 'kernel_update'
+
+export function holdSchedulableSlots(project, reason = KERNEL_UPDATE_HOLD) {
+  const held = []
+  for (const vm of listVms(project)) {
+    if (vm?.schedulable === false) continue
+    const summary = setVmSchedulable(project, vm.id, false, reason, { preserveStatus: true, source: 'force' })
+    if (summary) held.push(vm.id)
+  }
+  return held
+}
+
+export function resumeSchedulableSlots(project, ids, reason = KERNEL_UPDATE_HOLD) {
+  const restored = []
+  for (const id of ids || []) {
+    const vm = getVm(project, id)
+    if (!vm || vm.schedule_disabled_reason !== reason) continue
+    const summary = setVmSchedulable(project, id, true, null, { preserveStatus: true, source: 'force' })
+    if (summary?.schedulable !== false) restored.push(id)
+  }
+  return restored
+}
+
+export async function waitForSlotDrain(poolScheduler, ids, { timeoutMs = 120000 } = {}) {
+  const wanted = new Set((ids || []).map(String))
+  const count = () => {
+    let inflight = 0
+    for (const [vmId, value] of poolScheduler?.vmInflight || []) {
+      if (wanted.has(String(vmId))) inflight += Number(value) || 0
+    }
+    return inflight
+  }
+  const deadline = Date.now() + timeoutMs
+  let inflight = count()
+  while (inflight > 0 && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 200))
+    inflight = count()
+  }
+  return { ok: inflight === 0, inflight }
+}
+
+export function markKernelRestartPending(project, id, reason = 'kernel_restart_failed') {
+  return patchVmRecord(project, id, { kernel_restart_pending: reason })
+}
+
+export function clearKernelRestartPending(project, id) {
+  return patchVmRecord(project, id, (vm) => {
+    delete vm.kernel_restart_pending
+    return vm
+  })
 }
 
 export function bindVmProxy(projectRoot, id, proxyInfo) {
@@ -623,4 +702,24 @@ export function persistVmOwner(projectRoot, id, { ownerUserId = null, origin = n
   vm.updated_at = new Date().toISOString()
   atomicWriteJson(file, vm, { mode: 0o600 })
   return vm
+}
+
+/** Return administrator-assigned slots to the platform when their tenant is removed. */
+export function reclaimAssignedVms(projectRoot, ownerIds, { onError = null } = {}) {
+  const reclaimed = []
+  if (!ownerIds.size) return reclaimed
+  const dir = path.join(projectRoot, 'vms')
+  for (const name of listVmRecordFiles(dir)) {
+    try {
+      const vm = readJsonCached(path.join(dir, name))
+      if (!vm?.id || !ownerIds.has(vmOwnerId(vm)) || vmOriginOf(vm) !== VM_ORIGIN.adminAssigned) continue
+      // Keep credentials, quota cooldowns and the operator's scheduling switch intact.
+      persistVmOwner(projectRoot, vm.id, { ownerUserId: null, origin: VM_ORIGIN.platform })
+      reclaimed.push(vm.id)
+    } catch (error) {
+      if (!onError) throw error
+      onError(error, name)
+    }
+  }
+  return reclaimed
 }

@@ -8,6 +8,7 @@
  * Container restarts stay owned by the kernel watchdog's bounded budget: an
  * operator power cycle holds the watchdog off the VM and then resets its budget.
  */
+import { isDeepStrictEqual } from 'node:util'
 import { clusterManager, vmNodeId } from '../cluster/placement.mjs'
 import { containerLogs, inspectContainerOrNull } from '../cluster/docker-remote.mjs'
 import { slotEgressNames } from '../cluster/remote-slot.mjs'
@@ -29,7 +30,10 @@ import { slotExecContainer } from './slot-exec.mjs'
 import { slotHost } from './slot-host.mjs'
 import { slotExec, startSlotReady, stopSlot } from './slot-runtime.mjs'
 import { isCodexVm } from './vm-kind.mjs'
+import { isKvmRuntime } from './runtime-kind.mjs'
+import { slotDockerCpus } from './machine-spec.mjs'
 import { bindVmProxy, getVm, patchVmRecord, vmHasSchedulableCredential } from './vm-registry.mjs'
+import { isCredentialRefreshFailed } from '../pool/availability.mjs'
 
 const HEALTH_TIMEOUT_MS = 1500
 const BRIDGE_HEAL_MIN_MS = 60_000
@@ -133,7 +137,14 @@ function recordCheck(vm) {
 
 function credentialCheck(vm, projectRoot) {
   if (vmHasSchedulableCredential(vm, projectRoot)) return check('credential', '凭证', 'ok', null, '已导入可用凭证')
-  return check('credential', '凭证', 'error', 'no_credential', '未导入可用凭证，内核不会启动，测试对话必然失败')
+  const refreshFailed = isCredentialRefreshFailed({ vm, now: Date.now() })
+  return check(
+    'credential',
+    '凭证',
+    'error',
+    refreshFailed ? 'credential_refresh_failed' : 'no_credential',
+    refreshFailed ? '凭证已失效且刷新失败；请重新登录 / 导入凭证' : '未导入可用凭证；请登录 / 导入凭证',
+  )
 }
 
 function linkCheck(status, internal) {
@@ -349,9 +360,14 @@ export async function diagnoseSlotServices(
  * The POST /start boot: bind (or allocate) the exit, adopt its timezone, start
  * the container and its inference runtime, then record the running intent.
  */
-export async function powerOnSlot({ projectRoot, id, proxyPool, routing = {}, fillTimezone = null }) {
+export async function powerOnSlot({ projectRoot, id, proxyPool, routing = {}, fillTimezone = null, ops = {} }) {
   let vm = getVm(projectRoot, id)
   if (!vm) return { ok: false, status: 404, code: 'vm_not_found', error: 'vm not found' }
+  try {
+    if (!isKvmRuntime(vm)) slotDockerCpus(vm)
+  } catch (error) {
+    return { ok: false, status: 400, code: error.code, error: error.message }
+  }
   const bound = proxyPool.ensureBoundToVm(id, vm.proxy?.id || null)
   if (!bound) {
     return { ok: false, status: 409, code: 'proxy_required', error: 'No SOCKS5 is bound or free for this VM' }
@@ -359,7 +375,8 @@ export async function powerOnSlot({ projectRoot, id, proxyPool, routing = {}, fi
   bindVmProxy(projectRoot, id, bound)
   await (fillTimezone || ((vmId) => fillVmTimezoneFromExit(projectRoot, proxyPool, vmId)))(id)
   vm = getVm(projectRoot, id) || vm
-  const boot = await startSlotReady(vm, projectRoot, { routing })
+  const runtimeBeforeBoot = structuredClone(vm.runtime || {})
+  const boot = await (ops.startSlotReady || startSlotReady)(vm, projectRoot, { routing })
   if (!boot.ok) {
     return {
       ok: false,
@@ -370,11 +387,25 @@ export async function powerOnSlot({ projectRoot, id, proxyPool, routing = {}, fi
     }
   }
   const hasCred = vmHasSchedulableCredential(vm, projectRoot)
+  const runtime = boot.runtime || boot.docker?.runtime
   vm =
-    patchVmRecord(projectRoot, id, {
-      status: 'running',
-      schedulable: hasCred,
-      schedule_disabled_reason: hasCred ? null : 'no_credential',
+    patchVmRecord(projectRoot, id, (record) => {
+      const next = {
+        status: 'running',
+        schedulable: hasCred,
+        schedule_disabled_reason: hasCred ? null : 'no_credential',
+      }
+      if (runtime) {
+        const currentRuntime = record.runtime || {}
+        next.runtime = { ...runtime }
+        // Readiness can yield after the boot snapshot; retain newer runtime writes.
+        for (const key of new Set([...Object.keys(runtimeBeforeBoot), ...Object.keys(currentRuntime)])) {
+          if (isDeepStrictEqual(currentRuntime[key], runtimeBeforeBoot[key])) continue
+          if (Object.hasOwn(currentRuntime, key)) next.runtime[key] = currentRuntime[key]
+          else delete next.runtime[key]
+        }
+      }
+      return next
     }) || vm
   return { ok: true, vm, bound, boot }
 }
@@ -426,6 +457,12 @@ export async function recoverSlot({
   if (!vm) return { ok: false, status: 404, code: 'vm_not_found', error: 'vm not found' }
   if (recovering.has(id))
     return { ok: false, status: 409, code: 'recover_in_progress', error: '该槽位正在恢复中，请稍候' }
+  // Validate before holding the watchdog, repairing relays or stopping a live slot.
+  try {
+    if (!isKvmRuntime(vm)) slotDockerCpus(vm)
+  } catch (error) {
+    return { ok: false, status: 400, code: error.code, error: error.message }
+  }
   const manager = (ops.cluster || cluster)()
   const stop = ops.stopSlot || stopSlot
   const powerOn = ops.powerOn || ((args) => powerOnSlot(args))
@@ -608,7 +645,7 @@ export function createSlotBridgeHealer({
       if (seenProxies.has(proxy.id)) continue
       seenProxies.add(proxy.id)
       if (egressAlive(proxy.id) || !due(`egress:${proxy.id}`)) continue
-      const result = startEgress(proxy)
+      const result = await startEgress(proxy)
       if (result?.ok) logger.warn(`[bridge-heal] kin-egress ${proxy.id} was down; restarted`)
       else logger.warn(`[bridge-heal] kin-egress ${proxy.id} restart failed: ${result?.error || 'unknown'}`)
     }

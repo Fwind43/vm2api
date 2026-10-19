@@ -3,11 +3,7 @@
  * server wiring; this factory owns convert → pool → Go/Rust hop → client.
  */
 import { applyIntercept } from '../core/intercept.mjs'
-import {
-  streamIdleTimeoutMs as idleTimeoutFromRouting,
-  inboundBodyLimit,
-  queueKeepaliveDelayMs,
-} from '../core/config.mjs'
+import { resolveStreamIdleTimeoutMs, inboundBodyLimit, queueKeepaliveDelayMs } from '../core/config.mjs'
 import { applyEagerToolStreaming } from './eager-tool-streaming.mjs'
 import {
   inboundRefusalDeviceId,
@@ -117,13 +113,19 @@ import {
   standingUsageFromRoutingFile,
   personaModeFromRoutingFile,
 } from '../identity/crs-persona.mjs'
+import { presetFlagEnabled } from '../identity/persona-template.mjs'
 import {
   claudeCodeOnlyError,
   claudeCodeOnlyFromRouting,
   isClaudeCodeFamilyRequest,
 } from '../identity/claude-code-only.mjs'
 import { createDownstreamKeepalive } from './stream-keepalive.mjs'
-import { buildAnthropicSseError, createAnthropicStreamTracker, isRecoverableTruncation } from './stream-truncation.mjs'
+import {
+  buildAnthropicSseError,
+  createAnthropicSseErrorRemapper,
+  createAnthropicStreamTracker,
+  isRecoverableTruncation,
+} from './stream-truncation.mjs'
 import {
   hidePersonaUsageInSseLine,
   hidePersonaUsageOnMessage,
@@ -135,6 +137,8 @@ import {
   cacheBreakpointsFromRoutingFile,
   pinConversationCacheTtl,
   resolveCacheTtl,
+  fillMissingCacheTtl,
+  validateCacheBreakpoints,
 } from './cache-ttl.mjs'
 import { confirmCachePrefix, describeCacheContinuity, trackCachePrefix } from './cache-prefix.mjs'
 import { ensureClaudeWebSearch, shouldInjectClaudeWebSearch } from './web-search.mjs'
@@ -147,6 +151,7 @@ import { getVm } from '../vm/vm-registry.mjs'
 import { credentialModeFromOauth, isApiKeyMode } from '../oauth/credential-mode.mjs'
 import {
   prepareAnthropicRequest,
+  enforceCacheLimit,
   rewriteToolNames,
   restoreToolNames,
   restoreToolNamesInSSELine,
@@ -824,6 +829,17 @@ export function createHandleProtocol(deps) {
         return json(res, error.status, error.body)
       }
     } else ctx.body = applyMinMaxTokens(ctx.body, getRouting()?.compatibility?.min_max_tokens)
+    if (!requestContext && officialTraffic && officialCcPassthroughFromRouting(getRouting())) {
+      try {
+        validateCacheBreakpoints(ctx.body)
+      } catch (error) {
+        if (!error.body?.error) throw error
+        stats.errors++
+        logBag.error_code = error.body.error.code
+        logBag.error_message = error.body.error.message
+        return json(res, error.status, error.body)
+      }
+    }
 
     if (await applyProtocolIntercept({ req, inbound, body: ctx.body, fp, logBag, requestId: logCtx.request_id, res })) {
       return
@@ -1066,9 +1082,10 @@ export function createHandleProtocol(deps) {
         if (result?.ok && protocol !== 'anthropic.messages') res.write('data: [DONE]\n\n')
         return res.end()
       }
-      if (!result?.ok) {
+      if (!result?.ok || isIncompleteAssistantMessage(result)) {
         if (isClientCancelledResult(result)) return finishClientCancel(res, result, logBag)
-        const mapped = mapProtocolClientError(result, logBag, 'upstream_error')
+        const failed = isIncompleteAssistantMessage(result) ? incompleteAssistantClientError(result) : result
+        const mapped = mapProtocolClientError(failed, logBag, failed?.body?.error?.code || 'upstream_error')
         stats.errors++
         return sendMapped(res, mapped)
       }
@@ -1088,10 +1105,7 @@ export function createHandleProtocol(deps) {
     // First downstream byte during a queue wait. Short misses stay HTTP 429/529;
     // anything still waiting past this writes SSE so Cloudflare does not 524.
     const queueKeepaliveDelay = queueKeepaliveDelayMs(getRouting(), cfg.limits?.queue_keepalive_delay_ms)
-    const streamIdleTimeoutMs = idleTimeoutFromRouting(
-      getRouting(),
-      Number(cfg.limits.stream_idle_timeout_ms) || 180_000,
-    )
+    const streamIdleTimeoutMs = resolveStreamIdleTimeoutMs(getRouting(), cfg)
     const managedKey = req.apiKeyRecord || null
     if (managedKey) {
       const gate = apiKeyStore.acquire(managedKey)
@@ -1115,6 +1129,8 @@ export function createHandleProtocol(deps) {
 
     const clientStream = isClientStream(inbound, req.headers)
     const streamTracker = clientStream && protocol === 'anthropic.messages' ? createAnthropicStreamTracker() : null
+    const anthropicSseErrorRemapper =
+      clientStream && protocol === 'anthropic.messages' ? createAnthropicSseErrorRemapper() : null
     // One keepalive for the whole Claude stream, including session/seat queues
     // and the gaps between failover attempts. OpenAI keeps its per-attempt one.
     let activeAttemptCommit = null
@@ -1227,12 +1243,24 @@ export function createHandleProtocol(deps) {
           const credMode = credentialModeFromOauth(selected.vm?.claude || {})
           const modeOverride = slotPersonaModeOverride(selected.vm)
           const routingNow = getRouting()
+          const repaired = extra.repaired === true
+          const preserveThinkingBlocks =
+            !repaired &&
+            routingNow?.failover?.signature_repair !== true &&
+            (!keptAccount || keptAccount === selected.accountId)
+          // cli-node receives the cleaned body after this boundary. Keep every
+          // thinking block on the first hop and only let a repaired retry strip it.
+          const preserveCliHopThinkingBlocks = !repaired
           const officialPassthrough = officialTraffic && officialCcPassthroughFromRouting(routingNow)
           const cliHop = resolveOfficialCcInference(selected.vm, routingNow) === 'cli-hop'
+          const resolvedPersona = resolveSlotPersonaPreset(selected.vm, routingNow)
+          const preserveCallerEnvironment = !presetFlagEnabled(
+            routingNow?.compatibility,
+            'persona_env_presets',
+            resolvedPersona,
+          )
           let hopBody = body
           if (cliHop) {
-            const repaired = extra.repaired === true
-            const resolvedPersona = resolveSlotPersonaPreset(selected.vm, routingNow)
             // Classifier keeps its own system. Official family keeps its inbound
             // system only when the protocol tab turns passthrough on.
             const panelRewrite = !requestContext && !officialPassthrough
@@ -1242,6 +1270,8 @@ export function createHandleProtocol(deps) {
               cacheTtl: requestedCacheTtl,
               requestContext,
               preserveSystem: officialPassthrough,
+              preserveThinkingBlocks: preserveCliHopThinkingBlocks,
+              preserveCallerEnvironment,
             })
             hopBody = await materializeRemoteImageSources(hopBody)
             if (panelRewrite) {
@@ -1255,6 +1285,9 @@ export function createHandleProtocol(deps) {
                 cliVersion: OFFICIAL_CLI_VERSION,
                 identity,
               })
+              hopBody = fillMissingCacheTtl(hopBody, requestedCacheTtl)
+              enforceCacheLimit(hopBody)
+              validateCacheBreakpoints(hopBody)
               personaHideTokens = personaHideForUnofficial(personaIn, hopBody, {
                 officialClient: false,
                 mode: resolvedPersona,
@@ -1275,7 +1308,9 @@ export function createHandleProtocol(deps) {
               })
             }
             preserveCacheBreakpoints = true
-            cacheTtl = requestedCacheTtl
+            // Native wire may mix TTLs or leave caller TTL absent. The menu is
+            // not an accounting authority; retain the upstream 5m/1h split.
+            cacheTtl = null
             if (logCtx.capture_outbound) logBag.outbound_body = hopBody
 
             if (!panelRewrite) personaHideTokens = 0
@@ -1348,6 +1383,8 @@ export function createHandleProtocol(deps) {
             toolNameRewrite: openaiCompat ? false : getRouting()?.compatibility?.tool_name_rewrite !== false,
             cacheTtl,
             cacheBreakpoints,
+            preserveThinkingBlocks,
+            preserveCallerEnvironment,
             reqHeaders: req.headers,
             homeDir: selected.exec?.homeDir || '',
             credentialMode: credMode,
@@ -1447,7 +1484,8 @@ export function createHandleProtocol(deps) {
                 if (protocol === 'anthropic.messages') {
                   streamTracker?.observe(line)
                   if (!res.headersSent) writeSSEHeaders(res)
-                  res.write(String(line).endsWith('\n') ? String(line) : String(line) + '\n')
+                  const outbound = anthropicSseErrorRemapper ? anthropicSseErrorRemapper.remapLine(line) : line
+                  res.write(String(outbound).endsWith('\n') ? String(outbound) : String(outbound) + '\n')
                   return
                 }
                 const writeChunks = (chunks) => {

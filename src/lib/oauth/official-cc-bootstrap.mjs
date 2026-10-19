@@ -11,7 +11,7 @@
  * already-initialized residents without another hello.
  *
  * Every bootstrap CLI runs with CLAUDE_CODE_HOST_REFRESH=1 (the name
- * cli-node 2.1.293 reads) plus CLAUDE_CODE_VERSION. The host Go Refresher
+ * cli-node 2.1.296 reads) plus CLAUDE_CODE_VERSION. The host Go Refresher
  * is the only RT writer. Node never dials Anthropic.
  * After hello, quota is CLI `/usage` inside the slot (one try, then two retries).
  * Account tier comes from GET /api/oauth/profile via kin-worker oauth.
@@ -66,7 +66,7 @@ export const DEFAULT_OFFICIAL_CC_CONFIG = Object.freeze({
   wipe: true,
   apply_seed: true,
   reconcile_fingerprint: true,
-  sync_telemetry: true,
+  sync_telemetry: false,
   hello_prompt: DEFAULT_HELLO_PROMPT,
   timeout_ms: 4 * 60 * 1000,
   memory: '500m',
@@ -88,7 +88,7 @@ export function normalizeOfficialCcConfig(raw = {}) {
     wipe: src.wipe !== false,
     apply_seed: src.apply_seed !== false,
     reconcile_fingerprint: src.reconcile_fingerprint !== false,
-    sync_telemetry: src.sync_telemetry !== false,
+    sync_telemetry: src.sync_telemetry === true,
     hello_prompt: hello || DEFAULT_HELLO_PROMPT,
     timeout_ms:
       Number.isFinite(timeout) && timeout >= 30_000 && timeout <= 15 * 60 * 1000

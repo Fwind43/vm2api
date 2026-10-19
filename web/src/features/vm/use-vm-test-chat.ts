@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import type { TestModelsPayload, Vm } from '@/types/panel-vm'
 import { toast } from 'sonner'
@@ -6,17 +6,28 @@ import { api, isApiError } from '@/lib/api'
 import { isCodexVm } from '@/lib/vm-kind'
 import { testModelsQueryOptions } from '@/features/vm/queries'
 import type { TestChatResult } from '@/features/vm/test-chat-types'
+import { useVmPerms } from '@/features/vm/vm-perms'
 
 /** 详情页测试 Tab 与列表弹窗共用：模型列表、参数、发送与结果。 */
 export function useVmTestChat(vm: Vm) {
   const id = vm.id
   const qc = useQueryClient()
-  const testModels = useQuery(testModelsQueryOptions(id))
+  const canTest = useVmPerms().testModels
+  const testModels = useQuery({
+    ...testModelsQueryOptions(id),
+    enabled: canTest && !!id,
+  })
   const [prompt, setPrompt] = useState('hello')
   const [model, setModel] = useState('')
   const [maxTokens, setMaxTokens] = useState(8192)
   const [reasoningEffort, setReasoningEffort] = useState('medium')
   const [result, setResult] = useState<TestChatResult | null>(null)
+  const edited = useRef({
+    model: false,
+    prompt: false,
+    maxTokens: false,
+    reasoningEffort: false,
+  })
   const models = useMemo(
     () => testModels.data?.items || testModels.data?.models || [],
     [testModels.data]
@@ -28,6 +39,42 @@ export function useVmTestChat(vm: Vm) {
       setModel(models[0].id)
     }
   }, [models, model])
+
+  const onModelChange = useCallback((value: string) => {
+    edited.current.model = true
+    setModel(value)
+  }, [])
+  const onPromptChange = useCallback((value: string) => {
+    edited.current.prompt = true
+    setPrompt(value)
+  }, [])
+  const onMaxTokensChange = useCallback((value: number) => {
+    edited.current.maxTokens = true
+    setMaxTokens(value)
+  }, [])
+  const onReasoningEffortChange = useCallback((value: string) => {
+    edited.current.reasoningEffort = true
+    setReasoningEffort(value)
+  }, [])
+  const onLoadSchedule = useCallback(
+    (schedule: {
+      model: string
+      prompt: string
+      max_tokens: number | null
+      reasoning_effort: string | null
+    }) => {
+      if (!edited.current.model) setModel(schedule.model)
+      if (!edited.current.prompt) setPrompt(schedule.prompt)
+      if (isCodexVm(vm)) {
+        if (!edited.current.reasoningEffort) {
+          setReasoningEffort(schedule.reasoning_effort || 'medium')
+        }
+      } else if (!edited.current.maxTokens) {
+        setMaxTokens(schedule.max_tokens || 64)
+      }
+    },
+    [vm]
+  )
 
   const send = useMutation({
     mutationFn: () =>
@@ -77,6 +124,19 @@ export function useVmTestChat(vm: Vm) {
     },
   })
 
+  const refreshModels = useMutation({
+    mutationFn: () =>
+      api<TestModelsPayload>(
+        `/api/panel/test-models?vm_id=${encodeURIComponent(id)}&refresh=1`
+      ),
+    onSuccess: (data) => {
+      qc.setQueryData(testModelsQueryOptions(id).queryKey, data)
+    },
+    onError: (error: Error) => {
+      toast.error(error.message || '刷新模型失败')
+    },
+  })
+
   return {
     models,
     model,
@@ -85,26 +145,19 @@ export function useVmTestChat(vm: Vm) {
     reasoningEffort,
     result,
     running: send.isPending,
-    modelsRefreshing: testModels.isFetching,
-    onModelChange: setModel,
-    onPromptChange: setPrompt,
-    onMaxTokensChange: setMaxTokens,
-    onReasoningEffortChange: setReasoningEffort,
+    modelsRefreshing: testModels.isFetching || refreshModels.isPending,
+    canRefreshModels: canTest,
+    onModelChange,
+    onPromptChange,
+    onMaxTokensChange,
+    onReasoningEffortChange,
+    onLoadSchedule,
     onTest: () => {
       setResult(null)
       send.mutate()
     },
     onRefreshModels: () => {
-      void (async () => {
-        try {
-          const data = await api<TestModelsPayload>(
-            `/api/panel/test-models?vm_id=${encodeURIComponent(id)}&refresh=1`
-          )
-          qc.setQueryData(testModelsQueryOptions(id).queryKey, data)
-        } catch (error) {
-          toast.error((error as Error).message || '刷新模型失败')
-        }
-      })()
+      if (!refreshModels.isPending) refreshModels.mutate()
     },
   }
 }
