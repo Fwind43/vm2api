@@ -406,6 +406,96 @@ test('proxy transport error notifies onProxyFailure then rotates', async () => {
   assert.equal(failures[0].reason, 'proxy_transport_failure')
 })
 
+test('proxy transport error replays the same seat once before parking it', async () => {
+  const scheduler = new Scheduler([candidate(1)])
+  const runner = new FailoverRunner({
+    scheduler,
+    config: { same_account_retry_delay_ms: 0 },
+  })
+  const seen = []
+  let calls = 0
+  const result = await runner.run({
+    requestId: 'req-proxy-replay',
+    canonicalBody: { model: 'claude-sonnet-test' },
+    model: 'claude-sonnet-test',
+    callAttempt: ({ candidate: selected }) => {
+      seen.push(selected.accountId)
+      calls++
+      return calls === 1 ? upstreamNetworkError() : success('recovered')
+    },
+  })
+  assert.equal(result.ok, true)
+  assert.equal(result.attemptCount, 2)
+  assert.deepEqual(seen, ['account-1', 'account-1'])
+  assert.equal(scheduler.cooldowns.length, 0)
+})
+
+test('proxy transport error parks the seat only after the replay is spent', async () => {
+  const scheduler = new Scheduler([candidate(1)])
+  const runner = new FailoverRunner({
+    scheduler,
+    config: { same_account_retry_delay_ms: 0 },
+  })
+  const seen = []
+  const result = await runner.run({
+    requestId: 'req-proxy-park',
+    canonicalBody: { model: 'claude-sonnet-test' },
+    model: 'claude-sonnet-test',
+    callAttempt: ({ candidate: selected }) => {
+      seen.push(selected.accountId)
+      return upstreamNetworkError()
+    },
+  })
+  assert.equal(result.ok, false)
+  assert.equal(result.status, 502)
+  assert.deepEqual(seen, ['account-1', 'account-1'])
+  assert.equal(scheduler.cooldowns.length, 1)
+  assert.equal(scheduler.cooldowns[0].update.reason, 'proxy_transport_failure')
+  assert.ok(scheduler.cooldowns[0].update.until > Date.now())
+})
+
+test('proxy transport error parks immediately when the hop was too slow to replay', async () => {
+  const scheduler = new Scheduler([candidate(1)])
+  const runner = new FailoverRunner({
+    scheduler,
+    config: {
+      same_account_retry_delay_ms: 0,
+      same_account_retry_max_hop_ms: 0,
+    },
+  })
+  let calls = 0
+  const result = await runner.run({
+    requestId: 'req-proxy-slow',
+    canonicalBody: { model: 'claude-sonnet-test' },
+    model: 'claude-sonnet-test',
+    callAttempt: () => {
+      calls++
+      return upstreamNetworkError()
+    },
+  })
+  assert.equal(result.status, 502)
+  assert.equal(calls, 1)
+  assert.equal(scheduler.cooldowns.length, 1)
+  assert.equal(scheduler.cooldowns[0].update.reason, 'proxy_transport_failure')
+})
+
+function upstreamNetworkError(message = 'Connection error.') {
+  return {
+    ok: false,
+    status: 502,
+    terminalState: 'transport_error',
+    body: {
+      type: 'error',
+      error: {
+        type: 'api_error',
+        code: 'upstream_network_error',
+        message,
+        details: { upstream_type: 'api_error', upstream_status: 502 },
+      },
+    },
+  }
+}
+
 function badGateway(message = 'net/http: timeout awaiting response headers') {
   return {
     ok: false,

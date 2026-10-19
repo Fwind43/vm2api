@@ -219,6 +219,21 @@ function continueWithoutCooldown({ scope, reason, retrySameAccount = true } = {}
   }
 }
 
+/**
+ * The hop died before any byte reached the client, so replaying it on the same
+ * seat is safe: the runner retries once before the unit is parked. The cooldown
+ * is still returned so a second failure parks the seat instead of looping.
+ */
+function proxyTransportFailure(now) {
+  return {
+    scope: 'proxy',
+    action: 'continue-and-cooldown',
+    reason: 'proxy_transport_failure',
+    cooldownUntil: now + 60_000,
+    retrySameAccount: true,
+  }
+}
+
 function claudeStopReasonOf(result) {
   return assistantStopReason(result)
 }
@@ -404,12 +419,7 @@ function classifyUpstreamResultRaw(
   // Kernel / cli-node named the cause; none of these is the account's fault.
   if (workerCode === ErrorCode.UPSTREAM_NETWORK) {
     if (isProxyFailure('', message)) {
-      return {
-        scope: 'proxy',
-        action: 'continue-and-cooldown',
-        reason: 'proxy_transport_failure',
-        cooldownUntil: now + 60_000,
-      }
+      return proxyTransportFailure(now)
     }
     return continueWithoutCooldown({ scope: 'worker', reason: 'upstream_network_error', retrySameAccount: false })
   }
@@ -432,12 +442,7 @@ function classifyUpstreamResultRaw(
   }
   if (result.transportError || status === 0) {
     if (isProxyFailure(workerCode, message)) {
-      return {
-        scope: 'proxy',
-        action: 'continue-and-cooldown',
-        reason: 'proxy_transport_failure',
-        cooldownUntil: now + 60_000,
-      }
+      return proxyTransportFailure(now)
     }
     return continueWithoutCooldown({
       scope: 'worker',

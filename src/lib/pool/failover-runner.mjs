@@ -925,7 +925,16 @@ export class FailoverRunner {
           requestBody = repairAnthropicRequest(requestBody, policy)
           continue
         }
-        applyCooldown(this.scheduler, selected, policy, model, { diagnosticPin: !!pinVmId })
+        // A seat that can still replay this hop must not be parked first: the
+        // cooldown is account-scoped, so applying it here would block the replay
+        // itself and turn one transient hop blip into a full blackout on a
+        // one-seat pool. It is applied as soon as no replay is possible.
+        const hopMs = Date.now() - attemptStarted
+        const replayable =
+          shouldContinue(policy) &&
+          !isCredentialDeath(policy) &&
+          budget.allowSameUnit(selected.accountId, policy, hopMs, this.config.same_account_retry_max_hop_ms)
+        if (!replayable) applyCooldown(this.scheduler, selected, policy, model, { diagnosticPin: !!pinVmId })
         if (!pinVmId && isCredentialDeath(policy)) {
           this.forgetCredential(selected, policy, { familyKey, sessionKeys: bindKeys })
           if (familyKey) {
@@ -936,13 +945,12 @@ export class FailoverRunner {
           return { ...result, ...attribution(), finalState: result?.terminalState || 'rejected', policy }
         }
         policy = await this.recoverCredential(selected, policy)
-        const hopMs = Date.now() - attemptStarted
         if (isRetryableEmptyHop(policy)) {
           if (!emptyHopReleased(result) || pinVmId) return incompleteHopResult(result, policy, attribution())
           this.retireOutboundSession(selected, bindKeys)
           freshSlot = true
         }
-        if (budget.allowSameUnit(selected.accountId, policy, hopMs, this.config.same_account_retry_max_hop_ms)) {
+        if (replayable) {
           budget.noteSameUnit(selected.accountId)
           avoid = new Set([selected.accountId, selected.vmId])
           continue
@@ -1024,7 +1032,13 @@ export class FailoverRunner {
         if (committed || !shouldContinue(policy)) {
           return { ...result, ...attribution(), finalState: result.terminalState, policy }
         }
-        applyCooldown(this.scheduler, selected, policy, model, { diagnosticPin: !!pinVmId })
+        // Same rule as the result path: never park a seat that can still replay
+        // this hop, or the account-scoped cooldown blocks the replay itself.
+        const hopMs = Date.now() - attemptStarted
+        const replayable =
+          !isCredentialDeath(policy) &&
+          budget.allowSameUnit(selected.accountId, policy, hopMs, this.config.same_account_retry_max_hop_ms)
+        if (!replayable) applyCooldown(this.scheduler, selected, policy, model, { diagnosticPin: !!pinVmId })
         if (!pinVmId && isCredentialDeath(policy)) {
           this.forgetCredential(selected, policy, { familyKey, sessionKeys: bindKeys })
           if (familyKey) {
@@ -1032,8 +1046,7 @@ export class FailoverRunner {
           }
         }
         policy = await this.recoverCredential(selected, policy)
-        const hopMs = Date.now() - attemptStarted
-        if (budget.allowSameUnit(selected.accountId, policy, hopMs, this.config.same_account_retry_max_hop_ms)) {
+        if (replayable) {
           budget.noteSameUnit(selected.accountId)
           avoid = new Set([selected.accountId, selected.vmId])
           continue
