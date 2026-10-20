@@ -133,8 +133,10 @@ test('API backend applies the global official_full persona setting', async () =>
     assert.equal(response.status, 200)
     assert.ok(received)
     const outbound = JSON.parse(received.body)
-    assert.equal(outbound.system.length, 4)
-    assert.equal(outbound.system[2].text, `${DEFAULT_AGENT_STANDING}\n${CRS_OFFICIAL_AGENT_PROMPT}`)
+    assert.equal(outbound.system.length, 5)
+    assert.match(outbound.system[1].text, /You are Claude Code, Anthropic's official CLI for Claude/)
+    assert.match(outbound.system[2].text, /^# Reporting outcomes/)
+    assert.equal(outbound.system[3].text, `${DEFAULT_AGENT_STANDING}\n${CRS_OFFICIAL_AGENT_PROMPT}`)
   } finally {
     await new Promise((resolve) => kernel.close(resolve))
     fs.rmSync(root, { recursive: true, force: true })

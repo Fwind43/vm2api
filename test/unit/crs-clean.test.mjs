@@ -9,7 +9,7 @@ import {
   fromClaudeToResponses,
 } from '../../src/lib/protocol/convert.mjs'
 import { applyCrsIdentityReplace, uuidFromSeed } from '../../src/lib/identity/identity-rewrite.mjs'
-import { applyCrsUnofficialPersona, CRS_OFFICIAL_SYSTEM } from '../../src/lib/identity/crs-persona.mjs'
+import { applyCrsUnofficialPersona, CRS_OFFICIAL_CLI_SYSTEM } from '../../src/lib/identity/crs-persona.mjs'
 import { hidePersonaUsage, personaHideInputTokens } from '../../src/lib/identity/crs-persona-usage.mjs'
 import {
   TEST14_FEATURES,
@@ -220,7 +220,7 @@ test('normalizeAnthropicMessages is idempotent for legal turns', () => {
   ])
 })
 
-test('OpenAI chat unofficial rewrite is official 4-block plus caller --system append', () => {
+test('OpenAI chat unofficial rewrite is official 5-block plus caller --system append', () => {
   const { claude } = toClaudeMessages('openai.chat', {
     model: 'claude-haiku-4-5-20251001',
     messages: [
@@ -232,17 +232,17 @@ test('OpenAI chat unofficial rewrite is official 4-block plus caller --system ap
   })
   assert.deepEqual(claude.stop_sequences, ['END'])
   const cleaned = applyCrsUnofficialPersona(claude, { officialClient: false })
-  assert.equal(cleaned.system.length, 5)
-  assert.equal(cleaned.system[1].text, CRS_OFFICIAL_SYSTEM)
-  assert.equal(cleaned.system[4].text, 'you are a linter')
+  assert.equal(cleaned.system.length, 6)
+  assert.equal(cleaned.system[1].text, CRS_OFFICIAL_CLI_SYSTEM)
+  assert.equal(cleaned.system[5].text, 'you are a linter')
   assert.match(JSON.stringify(cleaned.messages[0].content), /MANDATORY constraints for this turn/)
   assert.ok(JSON.stringify(cleaned.messages[0].content).includes('hi'))
 })
 
-test('empty unofficial system without tools still writes official 4 blocks', () => {
+test('empty unofficial system without tools still writes official 5 blocks', () => {
   const out = applyCrsUnofficialPersona({ messages: [] }, { officialClient: false })
-  assert.equal(out.system.length, 4)
-  assert.equal(out.system[1].text, CRS_OFFICIAL_SYSTEM)
+  assert.equal(out.system.length, 5)
+  assert.equal(out.system[1].text, CRS_OFFICIAL_CLI_SYSTEM)
   assert.equal(out.messages.length, 0)
 })
 
@@ -253,15 +253,15 @@ test('official Claude Code system is not replaced or appended', () => {
   assert.equal(out.system.length, 1)
 })
 
-test('Xcode unofficial system is appended after official 4 blocks', () => {
+test('Xcode unofficial system is appended after official 5 blocks', () => {
   const body = {
     system: 'You are currently in Xcode. Help with Swift.',
     messages: [{ role: 'user', content: 'hi' }],
   }
   const out = applyCrsUnofficialPersona(body, { officialClient: false })
-  assert.equal(out.system.length, 5)
-  assert.equal(out.system[1].text, CRS_OFFICIAL_SYSTEM)
-  assert.equal(out.system[4].text, 'You are currently in Xcode. Help with Swift.')
+  assert.equal(out.system.length, 6)
+  assert.equal(out.system[1].text, CRS_OFFICIAL_CLI_SYSTEM)
+  assert.equal(out.system[5].text, 'You are currently in Xcode. Help with Swift.')
   assert.match(String(out.messages[0].content), /MANDATORY constraints for this turn/)
   assert.ok(String(out.messages[0].content).includes('hi'))
   assert.equal(out.messages.length, 1)
@@ -431,7 +431,7 @@ test('test14 OpenAI tools on /v1/messages convert to Anthropic get_weather', () 
   assert.equal(claude.tool_choice.name, 'get_weather')
 })
 
-test('test14 OpenAI chat records features and converts to official 4-block', () => {
+test('test14 OpenAI chat records features and converts to official 5-block', () => {
   const { claude } = toClaudeMessages('openai.chat', TEST14_OPENAI_INBOUND)
   const features = extractCaseFeatures(claude)
   assert.ok(matchesTest14Features(features))
