@@ -175,8 +175,11 @@ export function alignSamplingWithThinking(body = {}) {
  * Opus / Sonnet / Haiku 5.5 follow sub2api: one invalid block drops the whole
  * signed chain, including later valid thinking and redacted_thinking. Turns
  * left with no content are dropped. redacted_thinking stays when it carries
- * data on 5.5, otherwise when its signature is usable. The preserve path is
- * unchanged.
+ * data on 5.5, otherwise when its signature is usable. The preserve path
+ * (cli-hop first hop, default HTTP hop) skips the chain rule and keeps a
+ * signed block as-is, empty text and redacted_thinking included. A thinking
+ * block without a usable signature (missing, empty, shorter than 24, dummy)
+ * is dropped instead of forwarded with an empty signature.
  */
 export function stripInvalidThinkingBlocks(body = {}, { preserveThinkingBlocks = false } = {}) {
   if (!Array.isArray(body.messages)) return body
@@ -194,12 +197,11 @@ export function stripInvalidThinkingBlocks(body = {}, { preserveThinkingBlocks =
         if ((keepSigned || preserveThinkingBlocks) && message.role === 'assistant') {
           // Omitted thinking keeps empty text; redacted thinking keeps encrypted data.
           if (preserveThinkingBlocks) {
-            if (type === 'thinking' && !Object.hasOwn(block, 'signature')) {
+            if (type === 'redacted_thinking' || hasUsableThinkingSignature(block.signature)) {
+              content.push(block)
+            } else {
               changed = true
               filteredThis = true
-              content.push({ ...block, signature: '' })
-            } else {
-              content.push(block)
             }
             continue
           }
@@ -243,6 +245,39 @@ export function stripInvalidThinkingBlocks(body = {}, { preserveThinkingBlocks =
   return dropEmptySystemControlTurns({ ...body, messages: mergeConsecutiveAnthropicMessages(withoutEmpty) })
 }
 
+/**
+ * Rewrite history thinking / redacted_thinking blocks: `map(block, message)`
+ * returns the block to keep it, a replacement block, or null to drop it;
+ * every other block of the turn stays. A turn left empty goes and its
+ * neighbours merge. Returns the body unchanged when nothing changed.
+ * @returns {{ body: object, changed: number }}
+ */
+export function mapThinkingBlocks(body = {}, map = () => null) {
+  if (!Array.isArray(body?.messages)) return { body, changed: 0 }
+  let changed = 0
+  const messages = body.messages.map((message) => {
+    if (!Array.isArray(message?.content)) return message
+    let touched = false
+    const content = []
+    for (const block of message.content) {
+      const type = block?.type
+      const next = type === 'thinking' || type === 'redacted_thinking' ? map(block, message) : block
+      if (next === block) {
+        content.push(block)
+        continue
+      }
+      touched = true
+      changed += 1
+      if (next) content.push(next)
+    }
+    return touched ? { ...message, content } : message
+  })
+  if (!changed) return { body, changed }
+  const withoutEmpty = messages.filter(
+    (message) => !anthropicContentIsEmpty(message?.content) || messageHasTurnControls(message),
+  )
+  return { body: { ...body, messages: mergeConsecutiveAnthropicMessages(withoutEmpty) }, changed }
+}
 export const CONTEXT_MANAGEMENT_BETA = 'context-management-2025-06-27'
 export const PROMPT_CACHING_SCOPE_BETA = 'prompt-caching-scope-2026-01-05'
 export const MID_CONVERSATION_SYSTEM_BETA = 'mid-conversation-system-2026-04-07'

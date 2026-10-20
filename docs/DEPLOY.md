@@ -28,7 +28,7 @@ VM2API_DB_SECRET='再一串'
 
 不是一个父容器里多个子进程。
 
-槽位默认内存上限为 `512m`，在面板「规格」或 `routing.json` 的 `vm.memory` 配置（`256m` / `512m` / `1g` / `2g` / `4g` / `8g` / `16g`）。创建时可按槽覆盖，结果写在该槽 `vm.machine.memory`。已不再读取 `KIN_VM_MEMORY`。低于 1G 时，常驻 native host 与临时官方 CLI 同时运行可能 OOM；额度 API 探测本身不应额外启动推理 CLI。已有容器不会因控制面升级自动改内存，可在核对宿主余量后使用 `docker update --memory 1g --memory-swap 1g kin-<槽>`，不重建容器。
+槽位默认内存上限为 `512m`，在面板「规格」或 `routing.json` 的 `vm.memory` 配置（`256m` / `512m` / `1g` / `2g` / `4g` / `8g` / `16g`）。创建时可按槽覆盖，结果写在该槽 `vm.machine.memory`。已不再读取 `KIN_VM_MEMORY`。低于 1G 时，常驻 native host 与临时官方 CLI 同时运行可能 OOM；额度 API 探测本身不应额外启动推理 CLI。已有容器不会因控制面升级自动改内存，可在核对宿主余量后使用面板在线扩容，不重建容器。面板成功须 Docker HostConfig 的 memory 与 memory-swap 均等于请求值；若容器内可读 cgroup 限额（cgroup v2 的 `memory.max`，否则 v1 的 `memory/memory.limit_in_bytes`），则须与请求一致；读不到路径或值为 `max`/无上限哨兵时，在 HostConfig 已匹配的前提下跳过 cgroup 核对。`docker update` 成功后若后续校验失败，控制面会用扩容前的 memory/swap **回滚**容器限额且**不写** vm 配置；回滚失败时 API 会提示手动核对。内核每次准入按当前 cgroup 限额动态计算阈值，并按请求实际序列化大小限制在途负载。单次请求的 CLI 内存突增仍可能超过 512 MiB，准入不保证任意请求都能在此上限内运行。
 
 KVM 槽需要宿主 `/dev/kvm` 可读写（控制面在容器内时，用一次 `--device /dev/kvm` 的探测容器确认）。runner 降权给槽位用户跑 QEMU 时会带上 `/dev/kvm` 的设备组，属组与槽位主 GID 不同也能用。已有 KVM 槽要更新 `kin-kvm-*` 镜像并重建一次。没有 KVM 时不要在生产打开 `vm.allow_tcg`：那是 TCG 软件模拟，仅供测试。
 
@@ -52,7 +52,7 @@ sudo bash /opt/vm2api/deploy/install.sh check
 sudo bash /opt/vm2api/deploy/install.sh changelog
 ```
 
-保留 `.env` / `vms/` / `data/`。不要 `docker rm` 槽。一键更新会自动把新版 `share/wrap-cli`（包括 `kin-kernel.bin`）同步到所有槽并重启槽内 dataplane；如需暂时跳过可加 `--no-sync-wrap`。管理台 **设置 → 关于** 可复制同一条命令、看 changelog。指定版本：`--version v1.2.22`。
+保留 `.env` / `vms/` / `data/`。一键更新会把新版 `share/wrap-cli`（包括 `kin-kernel.bin`、`cli-node`、`cc-node`）同步到本机槽并重启槽内 dataplane；集群槽使用同一份二进制加上当前 Go `kin-worker` 遥测重建槽位镜像，再换容器，不改凭证和指纹。如需暂时跳过可加 `--no-sync-wrap`。管理台 **设置 → 关于** 可复制同一条命令、看 changelog。指定版本：`--version v1.2.22`。槽位重建可选「保留原数据」或「重建新特征」。
 
 首次登录后，在「用户」中找到当前管理员，点击「改密码」设置至少 8 位的新密码。默认密码管理员也会写入用户列表；修改后数据库密码优先，重启或更新不会被 `.env` 中的旧密码覆盖。
 

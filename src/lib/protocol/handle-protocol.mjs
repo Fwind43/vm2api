@@ -35,7 +35,7 @@ import {
   createClaudeMessageAssembler,
   applyClaudeSSELineToMessage,
 } from './convert.mjs'
-import { sanitizeInboundBody, defaultSeedPolicy } from './seed-policy.mjs'
+import { sanitizeInboundBody, defaultSeedPolicy, callerAutoCompactWindow } from './seed-policy.mjs'
 import { fingerprintRequest } from './client-fingerprint.mjs'
 import { validateOfficialModel } from './models.mjs'
 import { handleCodexProtocol, handleCodexSearch } from './handle-codex.mjs'
@@ -43,6 +43,7 @@ import { disjointOpenaiUsage } from './openai-usage.mjs'
 import { costColumnsFromUsage } from '../admin/pricing.mjs'
 import { detectInboundPlatform } from './platform-detect.mjs'
 import { normalizeCodexRouting } from './codex-route.mjs'
+import { applyCodexInboundModelRewrite } from './codex-model-mapping.mjs'
 import { hasClaudeCode1mSuffix } from './context-1m.mjs'
 import {
   DEFAULT_HEALTH_PROBE,
@@ -147,6 +148,11 @@ import { syncClaudeKernelConfigsFromFile } from '../transport/rust-kernel-superv
 import { ensureWorkerCredential } from '../transport/go-worker-client.mjs'
 import { formatPoolSelectionSummary } from '../pool/pool-scheduler.mjs'
 import { extraHeadersFromLimitError, isAccountQuotaExhausted } from '../pool/quota-window.mjs'
+import {
+  filterThinkingForAccount,
+  recordThinkingOwners,
+  thinkingOwners as defaultThinkingOwners,
+} from '../pool/thinking-owner.mjs'
 import { getVm } from '../vm/vm-registry.mjs'
 import { credentialModeFromOauth, isApiKeyMode } from '../oauth/credential-mode.mjs'
 import {
@@ -180,6 +186,7 @@ export function createHandleProtocol(deps) {
     typeof deps.getHealthMonitor === 'function' ? deps.getHealthMonitor() : deps.healthMonitor
   const getFailoverRunner = () =>
     typeof deps.getFailoverRunner === 'function' ? deps.getFailoverRunner() : deps.failoverRunner
+  const thinkingOwnerStore = deps.thinkingOwners || defaultThinkingOwners
   function responseClosed(res) {
     return !!(res?.destroyed || res?.writableEnded || res?.closed)
   }
@@ -618,11 +625,13 @@ export function createHandleProtocol(deps) {
       )
     }
 
+    const autoCompactWindow = callerAutoCompactWindow(inbound)
     let ctx = {
       path: pathName,
       protocol,
       body: sanitizeInboundBody(inbound, defaultSeedPolicy()),
       headers: { ...req.headers },
+      autoCompactWindow,
     }
     ctx = applyIntercept(cfg.intercept.rules, 'before_convert', ctx)
     const bodyCheck = validateRequestBody(protocol, ctx.body)
@@ -635,6 +644,24 @@ export function createHandleProtocol(deps) {
     }
     const inferenceBackend = resolveInferenceBackend(req)
     let want1m = hasClaudeCode1mSuffix(inbound?.model) || hasClaudeCode1mSuffix(ctx.body?.model)
+    const modelRewrite = applyCodexInboundModelRewrite(ctx.body, getRouting() || {})
+    if (!modelRewrite.ok) {
+      stats.errors++
+      const errorResult = makeError({
+        type: ErrorType.INVALID_REQUEST,
+        code: modelRewrite.code || 'codex_model_mapping_invalid',
+        message: modelRewrite.message,
+        status: 400,
+        param: 'model',
+      })
+      logBag.error_code = errorResult.body?.error?.code || modelRewrite.code
+      logBag.error_message = errorResult.body?.error?.message || null
+      return json(res, errorResult.status, errorResult.body)
+    }
+    if (modelRewrite.mapped) {
+      ctx = { ...ctx, body: modelRewrite.body }
+      logBag.upstream_model = modelRewrite.upstreamModel || null
+    }
     const platform = detectInboundPlatform(ctx.body?.model)
     if (!platform.ok) {
       stats.errors++
@@ -750,6 +777,7 @@ export function createHandleProtocol(deps) {
           projectRoot: cfg.paths.project,
           captureOutbound: logCtx.capture_outbound === true,
           accountGate,
+          ops: deps.codexOps || {},
           ...codexSticky,
         })
       }
@@ -767,6 +795,7 @@ export function createHandleProtocol(deps) {
         projectRoot: cfg.paths.project,
         captureOutbound: logCtx.capture_outbound === true,
         accountGate,
+        ops: deps.codexOps || {},
         ...codexSticky,
       })
     }
@@ -1201,6 +1230,17 @@ export function createHandleProtocol(deps) {
         deliveryMode,
         signal: clientAbort.signal,
         applyAttempt: async (body, selected, extra = {}) => {
+          // Only this account's own thinking replays as thinking. Another
+          // account's signature, or one with no record, goes out as text.
+          const owned = filterThinkingForAccount(body, selected.accountId, thinkingOwnerStore)
+          body = owned.body
+          if (owned.kept || owned.converted || owned.dropped) {
+            const { kept, converted, dropped, unknown } = owned
+            logBag.hop_meta = {
+              ...logBag.hop_meta,
+              thinking_owner: { account_id: selected.accountId, kept, converted, dropped, unknown },
+            }
+          }
           if (claudeScopePending()) {
             const blocked = await applyProtocolIntercept({
               req,
@@ -1272,6 +1312,7 @@ export function createHandleProtocol(deps) {
               preserveSystem: officialPassthrough,
               preserveThinkingBlocks: preserveCliHopThinkingBlocks,
               preserveCallerEnvironment,
+              autoCompactWindow: ctx.autoCompactWindow,
             })
             hopBody = await materializeRemoteImageSources(hopBody)
             if (panelRewrite) {
@@ -1374,6 +1415,7 @@ export function createHandleProtocol(deps) {
             vmId: selected.vmId,
             epoch: attemptStartedAt,
             mode: sessionMode,
+            routing: routingNow,
             clientDiscriminator,
             firstUserText,
             firstUserIdentity,
@@ -1533,6 +1575,9 @@ export function createHandleProtocol(deps) {
     logBag.vm_id = result?.vmId || null
     logBag.account_id = result?.accountId || null
     logBag.final_account_id = result?.accountId || null
+    if (result?.threadBetas) logBag.hop_meta = { ...logBag.hop_meta, thread_betas: result.threadBetas }
+    if (result?.accountId && (result.ok || result.committed))
+      recordThinkingOwners(result.body, result.accountId, thinkingOwnerStore)
     // Zero executions is a real 0, not unknown; the VM is the last one that ran.
     logBag.attempt_count = result?.attemptCount ?? 0
     logBag.final_state = result?.finalState || result?.terminalState || null

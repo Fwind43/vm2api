@@ -18,6 +18,12 @@ import { isKvmRuntime } from './runtime-kind.mjs'
 import { slotExecCmd } from './slot-exec.mjs'
 import { getVm } from './vm-registry.mjs'
 import { OFFICIAL_CLI_VERSION } from '../identity/vm-identity.mjs'
+import { ensureOfficialCredentialLink, writeWorkerCredentialFile } from '../oauth/oauth-credentials.mjs'
+import { assertAuthLoginReady, officialLoginCredentialToOauth } from '../oauth/claude-auth-login.mjs'
+import fs from 'node:fs'
+import path from 'node:path'
+import { ensureRemoteOfficialCredentialLink, reconcileSlotCredentials } from '../cluster/remote-slot-files.mjs'
+import { officialCcUidGid } from './vm-runtime.mjs'
 
 const SHELL_RE = /^\/api\/panel\/vms\/([^/]+)\/shell$/
 const TICKET_TTL_MS = 30_000
@@ -25,6 +31,94 @@ const MAX_TICKETS = 64
 const MAX_SESSIONS = 8
 const SESSION_ENV = 'KIN_PANEL_SHELL'
 const RC_ENV = 'KIN_PANEL_RC'
+
+function readJsonFile(file) {
+  try {
+    return JSON.parse(fs.readFileSync(file, 'utf8'))
+  } catch {
+    return null
+  }
+}
+
+/**
+ * The shell obtains the grant. The existing importer owns the worker file,
+ * worker notification, and vm.json metadata. The terminal keeps reading that
+ * same file through .credentials.json.
+ */
+/** Cluster slots write OAuth on the node claude/ mount; mirror it before adopt. */
+export async function syncShellLoginCredentials(
+  projectRoot,
+  vm,
+  {
+    phase,
+    host = slotHost(vm),
+    reconcile = reconcileSlotCredentials,
+    ensureRemoteLink = ensureRemoteOfficialCredentialLink,
+  } = {},
+) {
+  if (host.kind !== 'node') return { synced: false }
+  const slotDir = path.join(projectRoot, 'vms', vm.id)
+  if (phase === 'prepare') {
+    const reconciled = await reconcile(vm, slotDir)
+    await ensureRemoteLink(vm, slotDir)
+    return reconciled
+  }
+  if (phase === 'adopt') return host.afterRefresh(vm, slotDir)
+  return { synced: false }
+}
+
+export async function preparePanelShellLogin(projectRoot, vm) {
+  const home = path.join(projectRoot, 'vms', vm.id, 'cli-home')
+  const linked = ensureOfficialCredentialLink(home, {
+    ...officialCcUidGid(vm.id),
+    create: true,
+  })
+  if (!linked?.linked) {
+    const err = new Error(linked?.error || '官方凭证链接失败')
+    err.code = 'credential_link_failed'
+    throw err
+  }
+  await syncShellLoginCredentials(projectRoot, vm, { phase: 'prepare' })
+  return linked
+}
+
+export async function adoptShellLogin(projectRoot, vm, { importOauth = null, loginHost = null } = {}) {
+  const home = path.join(projectRoot, 'vms', vm.id, 'cli-home')
+  await syncShellLoginCredentials(projectRoot, vm, { phase: 'adopt', host: loginHost || slotHost(vm) })
+  ensureOfficialCredentialLink(home, officialCcUidGid(vm.id))
+  const official = path.join(home, '.claude', '.credentials.json')
+  const oauth = officialLoginCredentialToOauth(readJsonFile(official) || {})
+  const vmPath = path.join(projectRoot, 'vms', `${vm.id}.json`)
+  const existing = getVm(projectRoot, vm.id) || { ...vm, id: vm.id }
+  if (typeof importOauth === 'function') {
+    const committed = await importOauth({
+      vmId: vm.id,
+      vmPath,
+      existing,
+      oauth,
+      source: oauth.source,
+    })
+    if (!committed?.ok) {
+      const err = new Error(committed?.error?.message || '官方登录凭证未能导入槽凭证')
+      err.code = committed?.error?.code || 'credential_import_failed'
+      throw err
+    }
+  } else {
+    const written = writeWorkerCredentialFile(home, oauth)
+    if (!written) {
+      const err = new Error('官方登录凭证未能写入槽凭证')
+      err.code = 'credential_import_failed'
+      throw err
+    }
+  }
+  const linked = ensureOfficialCredentialLink(home, officialCcUidGid(vm.id))
+  if (!linked?.linked) {
+    const err = new Error(linked?.error || '终端凭证链接失败')
+    err.code = 'credential_link_failed'
+    throw err
+  }
+  return { imported: true, linked: true }
+}
 
 /** Live guest MOTD. Optional probes must not fail startup or print secrets. */
 const SYSTEM_FACTS_RC = [
@@ -211,6 +305,7 @@ export function panelShellLaunch(cliBin) {
     'if [ ! -e "$HOME/.claude.json" ] && [ -f "$CLAUDE_CONFIG_DIR/.claude.json" ]; then ln -s .claude/.claude.json "$HOME/.claude.json" 2>/dev/null || true; fi',
     `claude() { export HOME="\${HOME:-/home/kincli}"; export CLAUDE_CONFIG_DIR="\${CLAUDE_CONFIG_DIR:-\$HOME/.claude}"; if [ -x ${q} ]; then ${q} "$@"; else echo "cli-node 不在 ${q}" >&2; return 127; fi; }`,
     SYSTEM_FACTS_RC,
+    'if [ -n "${KIN_PANEL_LOGIN:-}" ]; then printf "\\n"; claude auth login; fi',
     'rm -f "$KIN_PANEL_RCFILE"',
   ].join('\n')
   return {
@@ -236,22 +331,35 @@ function refuse(status, code, message) {
   return { ok: false, status, error: { code, message } }
 }
 
-export function createSlotShell({ projectRoot, logger = console }) {
+export function createSlotShell({
+  projectRoot,
+  logger = console,
+  importOauth = null,
+  authLoginReady = null,
+  upgradeLoginReady = null,
+} = {}) {
   const tickets = new Map()
   const liveTokens = new Set()
   let sessions = 0
   const wss = new WebSocketServer({ noServer: true, maxPayload: 1 << 20 })
 
-  function issueTicket(vmId) {
+  async function issueTicket(vmId, { login = false } = {}) {
     const vm = getVm(projectRoot, vmId)
     if (!vm) return refuse(404, 'vm_not_found', 'vm not found')
     if (isCodexVm(vm)) return refuse(409, 'no_container', 'GPT 槽没有容器，无法打开终端')
+    if (login) {
+      try {
+        await (authLoginReady || assertAuthLoginReady)(projectRoot, vm)
+      } catch (err) {
+        return refuse(409, err.code || 'auth_login_not_ready', err.message)
+      }
+    }
     if (sessions >= MAX_SESSIONS) return refuse(429, 'shell_limit', `终端会话已达上限 ${MAX_SESSIONS}`)
     const now = Date.now()
     for (const [t, v] of tickets) if (v.exp <= now) tickets.delete(t)
     if (tickets.size >= MAX_TICKETS) return refuse(429, 'shell_limit', '终端 ticket 过多，请稍后再试')
     const ticket = crypto.randomBytes(24).toString('base64url')
-    tickets.set(ticket, { vmId: vm.id, exp: now + TICKET_TTL_MS })
+    tickets.set(ticket, { vmId: vm.id, exp: now + TICKET_TTL_MS, login })
     return { ok: true, ticket, expires_in: TICKET_TTL_MS / 1000 }
   }
 
@@ -259,7 +367,8 @@ export function createSlotShell({ projectRoot, logger = console }) {
   function consumeTicket(ticket, vmId) {
     const entry = tickets.get(ticket)
     tickets.delete(ticket)
-    return !!entry && entry.vmId === vmId && entry.exp > Date.now()
+    if (!entry || entry.vmId !== vmId || entry.exp <= Date.now()) return null
+    return entry
   }
 
   function rejectUpgrade(socket, status, text) {
@@ -273,7 +382,9 @@ export function createSlotShell({ projectRoot, logger = console }) {
     const sm = SHELL_RE.exec(url.pathname)
     if (!sm) return false
     const vmId = decodeURIComponent(sm[1])
-    if (!consumeTicket(url.searchParams.get('ticket') || '', vmId)) {
+    const ticket = url.searchParams.get('ticket') || ''
+    const entry = consumeTicket(ticket, vmId)
+    if (!entry) {
       rejectUpgrade(socket, 401, 'Unauthorized')
       return true
     }
@@ -282,16 +393,38 @@ export function createSlotShell({ projectRoot, logger = console }) {
       rejectUpgrade(socket, 404, 'Not Found')
       return true
     }
-    if (sessions >= MAX_SESSIONS) {
-      rejectUpgrade(socket, 429, 'Too Many Requests')
+    const requestedLogin = url.searchParams.get('login') === '1'
+    if (requestedLogin !== !!entry.login) {
+      rejectUpgrade(socket, 409, 'Conflict')
       return true
     }
-    sessions += 1
-    const size = {
-      cols: clampInt(url.searchParams.get('cols'), 10, 500, 80),
-      rows: clampInt(url.searchParams.get('rows'), 5, 200, 24),
+    const login = !!entry.login
+    const accept = () => {
+      if (sessions >= MAX_SESSIONS) {
+        rejectUpgrade(socket, 429, 'Too Many Requests')
+        return
+      }
+      sessions += 1
+      const size = {
+        cols: clampInt(url.searchParams.get('cols'), 10, 500, 80),
+        rows: clampInt(url.searchParams.get('rows'), 5, 200, 24),
+        login,
+      }
+      wss.handleUpgrade(req, socket, head, (ws) => attach(ws, vm, size))
     }
-    wss.handleUpgrade(req, socket, head, (ws) => attach(ws, vm, size))
+    if (!login) {
+      accept()
+      return true
+    }
+    ;(upgradeLoginReady || authLoginReady || assertAuthLoginReady)(projectRoot, vm).then(accept, (err) =>
+      rejectUpgrade(
+        socket,
+        409,
+        String(err?.message || 'Conflict')
+          .replace(/[\r\n]+/g, ' ')
+          .slice(0, 120) || 'Conflict',
+      ),
+    )
     return true
   }
 
@@ -349,8 +482,10 @@ export function createSlotShell({ projectRoot, logger = console }) {
     })
     try {
       connect = slotHost(vm).dockerApi()
+      if (size.login) await preparePanelShellLogin(projectRoot, vm)
       const launch = panelShellLaunch(slotHost(vm).bins.cli)
       const env = ['TERM=xterm-256color', `${SESSION_ENV}=${token}`, `${RC_ENV}=${launch.rc}`]
+      if (size.login) env.push('KIN_PANEL_LOGIN=1')
       const { Cmd } = slotExecCmd(vm, launch.cmd, {
         env: isKvmRuntime(vm) ? env : undefined,
         interactive: true,
@@ -380,6 +515,14 @@ export function createSlotShell({ projectRoot, logger = console }) {
     const onEnd = async () => {
       if (ended) return
       ended = true
+      if (size.login) {
+        try {
+          await adoptShellLogin(projectRoot, vm, { importOauth })
+        } catch (err) {
+          logger.warn?.(`[slot-shell] ${vm.id} login import failed: ${err.message}`)
+          send(JSON.stringify({ t: 'error', message: '官方登录凭证未能导入槽凭证' }))
+        }
+      }
       const info = await inspectExec(connect, session.execId).catch(() => null)
       send(JSON.stringify({ t: 'exit', code: info?.ExitCode ?? null }))
       ws.close(1000)
