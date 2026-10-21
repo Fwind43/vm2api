@@ -1854,3 +1854,32 @@ test('an all-rest pool 503 carries Retry-After for the next window open', async 
   assert.equal(result.body.error.code, 'account_pool_exhausted')
   assert.equal(result.retryAfterSec, 91)
 })
+
+for (const committed of [false, true]) {
+  test(`transport window permits only pre-content recovery (committed=${committed})`, async () => {
+    const scheduler = new Scheduler([candidate(1)])
+    const runner = new FailoverRunner({
+      scheduler,
+      config: {
+        same_account_retry_delay_ms: 0,
+        same_account_retry_max_hop_ms: 1,
+        transport_retry_max_hop_ms: 1000,
+      },
+    })
+    let calls = 0
+    const result = await runner.run({
+      requestId: 'transport-window',
+      canonicalBody: { model: 'claude-sonnet-test' },
+      model: 'claude-sonnet-test',
+      callAttempt: async ({ onCommit }) => {
+        calls++
+        if (calls > 1) return success('recovered')
+        await new Promise((resolve) => setTimeout(resolve, 10))
+        if (committed) onCommit()
+        return { ...upstreamNetworkError(), committed }
+      },
+    })
+    assert.equal(calls, committed ? 1 : 2)
+    assert.equal(result.ok, !committed)
+  })
+}

@@ -39,6 +39,7 @@ const DEFAULTS = {
   max_same_account_retries: 1,
   same_account_retry_delay_ms: 500,
   same_account_retry_max_hop_ms: 10_000,
+  transport_retry_max_hop_ms: 30_000,
   signature_repair: false,
 }
 
@@ -985,7 +986,16 @@ export class FailoverRunner {
         const replayable =
           shouldContinue(policy) &&
           !isCredentialDeath(policy) &&
-          budget.allowSameUnit(selected.accountId, policy, hopMs, this.config.same_account_retry_max_hop_ms)
+          budget.allowSameUnit(
+            selected.accountId,
+            policy,
+            hopMs,
+            policy.reason === 'proxy_transport_failure'
+              ? this.config.same_account_retry_max_hop_ms <= 0
+                ? 0
+                : this.config.transport_retry_max_hop_ms
+              : this.config.same_account_retry_max_hop_ms,
+          )
         if (!replayable) applyCooldown(this.scheduler, selected, policy, model, { diagnosticPin: !!pinVmId })
         if (!pinVmId && isCredentialDeath(policy)) {
           this.forgetCredential(selected, policy, { familyKey, sessionKeys: bindKeys })
@@ -1107,7 +1117,16 @@ export class FailoverRunner {
         const hopMs = Date.now() - attemptStarted
         const replayable =
           !isCredentialDeath(policy) &&
-          budget.allowSameUnit(selected.accountId, policy, hopMs, this.config.same_account_retry_max_hop_ms)
+          budget.allowSameUnit(
+            selected.accountId,
+            policy,
+            hopMs,
+            policy.reason === 'proxy_transport_failure'
+              ? this.config.same_account_retry_max_hop_ms <= 0
+                ? 0
+                : this.config.transport_retry_max_hop_ms
+              : this.config.same_account_retry_max_hop_ms,
+          )
         if (!replayable) applyCooldown(this.scheduler, selected, policy, model, { diagnosticPin: !!pinVmId })
         if (!pinVmId && isCredentialDeath(policy)) {
           this.forgetCredential(selected, policy, { familyKey, sessionKeys: bindKeys })
