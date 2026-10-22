@@ -1,3 +1,4 @@
+import { safeTiming } from '../transport/stream-timing.mjs'
 // Bounded metadata only: never persist arbitrary error messages, URLs or credentials.
 export function attemptDiagnostic(attemptNo, result = {}, policy = {}) {
   const error = result?.body?.error || result?.error || {}
@@ -8,6 +9,7 @@ export function attemptDiagnostic(attemptNo, result = {}, policy = {}) {
       ?.toUpperCase() || null
   return {
     attempt: attemptNo,
+    timing: safeTiming(result?.timing),
     upstream_status: result?.status ?? null,
     content_committed: result?.committed === true,
     first_token_ms: result?.ttftMs ?? null,
