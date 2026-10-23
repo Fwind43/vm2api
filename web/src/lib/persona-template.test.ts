@@ -54,6 +54,9 @@ describe('persona template contract', () => {
 describe('agent standing + system preview', () => {
   const vars = {
     identity: 'ID',
+    identity_cli: 'ID',
+    reporting: 'REPORTING',
+    dynamic_boundary: 'BOUNDARY',
     agent_official: 'AGENT',
     env_official: 'ENV',
     caller_agent: '',
@@ -213,17 +216,12 @@ describe('agent standing + system preview', () => {
       )
     ).toEqual({ env_official: 'ENV', timezone: 'UTC' })
 
-    const fullVars = {
-      ...vars,
-      identity_cli: 'CLI_ID',
-      reporting: 'REPORTING',
-      dynamic_boundary: 'BOUNDARY',
-      env_official: 'ENV',
-      timezone: 'Asia/Tokyo',
-    }
     const fullOn = previewSystemBlocks(
       DEFAULT_PERSONA_TEMPLATES.official_full,
-      fullVars
+      {
+        ...vars,
+        env_official: 'ENV',
+      }
     )
     expect(fullOn.map((block) => block.id)).toEqual([
       'identity',
@@ -232,15 +230,13 @@ describe('agent standing + system preview', () => {
       'dynamic_boundary',
       'env_official',
     ])
-    expect(fullOn.find((block) => block.id === 'agent_official')).toMatchObject(
-      {
-        text: 'AGENT',
-        placeholder: false,
-        ttl: '1h',
-        scope: '',
-      }
-    )
-    expect(fullOn.find((block) => block.id === 'env_official')).toMatchObject({
+    expect(fullOn[2]).toMatchObject({
+      text: 'AGENT',
+      placeholder: false,
+      ttl: '1h',
+      scope: '',
+    })
+    expect(fullOn[4]).toMatchObject({
       text: 'ENV',
       placeholder: false,
       ttl: '1h',
@@ -249,12 +245,24 @@ describe('agent standing + system preview', () => {
 
     const fullOff = previewSystemBlocks(
       DEFAULT_PERSONA_TEMPLATES.official_full,
-      applyPersonaEnvVars(fullVars, isolated, 'official_full')
+      applyPersonaEnvVars(
+        { ...vars, env_official: 'ENV', timezone: 'Asia/Tokyo' },
+        isolated,
+        'official_full'
+      )
     )
-    expect(fullOff).toEqual(
-      fullOn.filter((block) => block.id !== 'env_official')
-    )
-    expect(fullOff.some((block) => block.placeholder)).toBe(false)
+    expect(fullOff.map((block) => block.id)).toEqual([
+      'identity',
+      'reporting',
+      'agent_official',
+      'dynamic_boundary',
+    ])
+    expect(
+      fullOff.find((block) => block.id === 'agent_official')
+    ).toMatchObject({
+      placeholder: false,
+    })
+    expect(fullOff.some((block) => block.id === 'env_official')).toBe(false)
 
     expect(
       previewSystemBlocks(

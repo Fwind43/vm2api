@@ -93,6 +93,7 @@ import { effectiveOpenAIPolicy, normalizeOpenAIQuotaPolicy } from '../pool/opena
 import { openAIRuntimeSignals } from '../pool/openai-account-runtime.mjs'
 import { normalizeVmConfig, memoryMiB } from '../vm/machine-spec.mjs'
 import { runtimeKind } from '../vm/runtime-kind.mjs'
+import { telemetryUploadInterval } from '../vm/worker-telemetry.mjs'
 
 export function ok(data, meta) {
   const out = { ok: true, data }
@@ -1443,6 +1444,7 @@ export function buildRouting({ routingConfig, stickyRouter }) {
     usage_probe: normalizeUsageProbeConfig(routingConfig?.usage_probe),
     notify: publicNotifyConfig(routingConfig?.notify),
     vm: normalizeVmConfig(routingConfig?.vm),
+    telemetry: { upload_interval_seconds: telemetryUploadInterval(routingConfig) },
     sessions: stickyRouter.stats(),
   })
 }
@@ -1900,6 +1902,8 @@ function enrichVm(v, accountQuota, active, extras = {}) {
     note: v.note || null,
     region: v.region || null,
     node_id: v.node_id || null,
+    owner_user_id: v.owner_user_id || null,
+    origin: v.origin || null,
     ...(canRevealClusterNodes(extras.role || 'admin') && v.node_id
       ? { node_name: nodeNameOf(extras.clusterNodes, v.node_id) }
       : {}),

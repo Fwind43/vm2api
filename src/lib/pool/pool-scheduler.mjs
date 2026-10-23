@@ -51,6 +51,7 @@ import { resolveSessionSlots } from '../vm/slot-engine.mjs'
 import { SeatPlanner, rankSeatCandidates } from './seat-planner.mjs'
 import { GATE_DRAINING } from './quota-gate.mjs'
 import { activeHoursOf, evaluateActiveHours } from './active-hours.mjs'
+import { vmNodeReady } from '../cluster/placement.mjs'
 
 const WAIT_TIMEOUT_MIN_MS = 1000
 const WAIT_TIMEOUT_MAX_MS = 120000
@@ -1070,7 +1071,11 @@ export class PoolScheduler extends EventEmitter {
       if (!rest.active) return { ok: false, reason: 'rest_period', until: rest.until }
     }
     const workerStatus = await this.getWorkerHealth(this.executionContext(vm, accountId), { signal })
-    const cred = evaluateCredentialEligibility({ vm, workerStatus, now })
+    // Health probing is asynchronous. Re-read time before applying cooldown
+    // and credential gates, otherwise a cooldown that expired during the hop
+    // can be re-enqueued with an already-past wakeup and lose its notification.
+    const eligibilityNow = Date.now()
+    const cred = evaluateCredentialEligibility({ vm, workerStatus, now: eligibilityNow })
     if (!cred.ok) return cred
     state = this.runtimeRepo?.get?.(accountId) || state
     if (isLeftoverGrantRevokeRuntime(state, vm)) {
@@ -1093,7 +1098,7 @@ export class PoolScheduler extends EventEmitter {
         cooldown_reason: null,
       }
     }
-    if (isCredentialRuntimeBlocked(state, now, vm)) return { ok: false, reason: 'credential_blocked' }
+    if (isCredentialRuntimeBlocked(state, eligibilityNow, vm)) return { ok: false, reason: 'credential_blocked' }
     const fallbackCap = parseConcurrency(this.config.default_max_per_account, 2)
     const maxConcurrency = this.effectiveMaxConcurrency(vm, account, fallbackCap)
     if (maxConcurrency <= 0) return { ok: false, reason: 'concurrency_disabled' }
@@ -1104,15 +1109,15 @@ export class PoolScheduler extends EventEmitter {
       busy = true
       waitReason = waitReason || reason
       const next = Number(until) || 0
-      if (next > now) availableAt = availableAt ? Math.min(availableAt, next) : next
+      if (next > eligibilityNow) availableAt = availableAt ? Math.min(availableAt, next) : next
     }
-    if (state && cooldownActive(state.cooldown_until, now) && !leftoverNoRefreshPark) {
+    if (state && cooldownActive(state.cooldown_until, eligibilityNow) && !leftoverNoRefreshPark) {
       markWait('account_cooldown', state.cooldown_until)
     }
     const modelKey = normalizeModel(model)
     for (const key of modelCooldownKeys(modelKey)) {
       const modelState = state?.model_states?.[key]
-      if (modelState && cooldownActive(modelState.cooldown_until, now)) {
+      if (modelState && cooldownActive(modelState.cooldown_until, eligibilityNow)) {
         markWait(key === FABLE_FAMILY_KEY ? 'fable_cooldown' : 'model_cooldown', modelState.cooldown_until)
       }
     }
@@ -1149,6 +1154,8 @@ export class PoolScheduler extends EventEmitter {
     }
     // A sticky preference must not bypass exhausted kernel recovery.
     if (kernelFaults.has(vm.id)) return { ok: false, reason: 'kernel_faulted' }
+    // Node offline or asleep: the relay has no link behind it, a pick would only fail. Back on reconnect.
+    if (!vmNodeReady(vm)) return { ok: false, reason: 'node_offline' }
     if (rustKernelBusy(workerStatus)) {
       markWait('slot_busy')
     } else if (workerStatus && rustKernelProcessUp(workerStatus) && !rustKernelReachable(workerStatus)) {

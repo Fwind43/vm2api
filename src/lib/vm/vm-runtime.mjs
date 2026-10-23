@@ -8,6 +8,7 @@ import { execFileSync } from 'node:child_process'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
+import { slotHost } from './slot-host.mjs'
 import { maxRequestBytes, readRoutingConfigFile, streamIdleTimeoutMs } from '../core/config.mjs'
 import { US_TIMEZONES, validTimezone } from '../core/timezone.mjs'
 import { runtimeKind, isKvmRuntime, RUNTIME_KVM } from './runtime-kind.mjs'
@@ -36,6 +37,7 @@ import {
 import { slotMemory, slotDockerCpus, memoryMiB, VM_CONFIG_DEFAULTS } from './machine-spec.mjs'
 import { probeLocalKvm } from './kvm-host.mjs'
 import { slotExecArgv } from './slot-exec.mjs'
+import { isDockerInspectNotFound } from './docker-container.mjs'
 
 export const RUNTIME = 'docker'
 const WORKER_BIN = process.env.KIN_WORKER_BIN || '/opt/kin-gateway/bin/kin-worker'
@@ -147,16 +149,8 @@ export function displayName(vmId) {
   return String(vmId || '').replace(/^vm-/, '')
 }
 
-export function inspectContainer(name) {
-  const r = sh([
-    'docker',
-    'inspect',
-    '--format',
-    '{{.State.Running}}|{{.State.Pid}}|{{.HostConfig.NetworkMode}}|{{.State.StartedAt}}|{{.Config.Image}}|{{.Config.Hostname}}|{{index .Config.Labels "kin.vm.runtime"}}|{{index .Config.Labels "kin.vm.role"}}|{{.State.Restarting}}',
-    name,
-  ])
-  if (!r.ok) return null
-  const [running, pid, networkMode, startedAt, image, hostname, runtime, role, restarting] = r.stdout.split('|')
+function parseInspectStdout(name, stdout) {
+  const [running, pid, networkMode, startedAt, image, hostname, runtime, role, restarting] = stdout.split('|')
   // Docker reports Running=true during a restart-policy backoff; nothing can be exec'd there.
   const crashLooping = restarting === 'true'
   return {
@@ -172,6 +166,28 @@ export function inspectContainer(name) {
     runtime: String(runtime || '').trim() || null,
     role: String(role || '').trim() || null,
   }
+}
+
+const INSPECT_FORMAT =
+  '{{.State.Running}}|{{.State.Pid}}|{{.HostConfig.NetworkMode}}|{{.State.StartedAt}}|{{.Config.Image}}|{{.Config.Hostname}}|{{index .Config.Labels "kin.vm.runtime"}}|{{index .Config.Labels "kin.vm.role"}}|{{.State.Restarting}}'
+
+/**
+ * @returns {{ status: 'found', container: object } | { status: 'missing' } | { status: 'error', error: string, code?: number }}
+ */
+export function inspectContainerOutcome(name, { run = sh } = {}) {
+  const r = run(['docker', 'inspect', '--format', INSPECT_FORMAT, name])
+  if (r.ok) return { status: 'found', container: parseInspectStdout(name, r.stdout) }
+  if (isDockerInspectNotFound(r)) return { status: 'missing' }
+  return {
+    status: 'error',
+    error: (r.stderr || r.stdout || 'docker inspect failed').trim(),
+    code: r.code,
+  }
+}
+
+export function inspectContainer(name, opts) {
+  const outcome = inspectContainerOutcome(name, opts)
+  return outcome.status === 'found' ? outcome.container : null
 }
 
 /** Label on GPT slot containers: their PID 1 idles; the Codex kernel runs on the host. */
@@ -355,7 +371,7 @@ export function isSlotProxyDesynced(vm, projectRoot) {
 }
 
 /** Write worker.json.telemetry from seed_policy. Does not bounce the process. */
-export function syncWorkerTelemetry(vm, projectRoot) {
+export function syncWorkerTelemetry(vm, projectRoot, routing = null) {
   if (!vm?.id || !projectRoot) return { wrote: false }
   const paths = workerPaths(projectRoot, vm.id)
   if (!fs.existsSync(paths.config)) return { wrote: false }
@@ -366,7 +382,7 @@ export function syncWorkerTelemetry(vm, projectRoot) {
     return { wrote: false }
   }
   if (!doc || typeof doc !== 'object') return { wrote: false }
-  doc.telemetry = buildWorkerTelemetry(vm, projectRoot)
+  doc.telemetry = buildWorkerTelemetry(vm, projectRoot, routing)
   replaceSlotOwnedFile(paths.config, JSON.stringify(doc, null, 2) + '\n', vm)
   return { wrote: true, enabled: doc.telemetry.enabled === true }
 }
@@ -526,10 +542,11 @@ export function writeWorkerFiles(vm, projectRoot, { transparent, routing } = {})
   if (!onEgress && !local && vm.proxy_required !== false && !proxyUrl) throw new Error('slot SOCKS5 proxy is required')
   const testEndpoints = process.env.KIN_WORKER_TEST_ENDPOINTS === '1'
   const resolvedRouting = resolveSlotRouting(projectRoot, routing)
+  const nodePaths = slotHost(vm).slotPaths?.(vm) || null
   const workerConfig = {
     vm_id: vm.id,
-    socket_path: '/run/kin/worker.sock',
-    credential_path: '/home/kincli/.claude/credentials.json',
+    socket_path: nodePaths ? `${nodePaths.run}/worker.sock` : '/run/kin/worker.sock',
+    credential_path: nodePaths ? `${nodePaths.claude}/credentials.json` : '/home/kincli/.claude/credentials.json',
     proxy_url: proxyUrl,
     proxy_required: onEgress || local ? false : vm.proxy_required !== false,
     internal_token: token,

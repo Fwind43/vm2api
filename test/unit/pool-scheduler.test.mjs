@@ -334,6 +334,35 @@ test('cooldown is waitable and becomes selectable after it expires', async (t) =
   selected.release()
 })
 
+test('refreshes cooldown time after an async health check crosses the expiry', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const repo = new RuntimeRepo()
+  const pool = new PoolScheduler({
+    projectRoot: root,
+    runtimeRepo: repo,
+    accountQuota: { canAccept: () => ({ ok: true }) },
+    workerHealth: async () => {
+      await new Promise((resolve) => setTimeout(resolve, 60))
+      return { ok: true, credential: { generation: 1, has_access: true } }
+    },
+    config: { fallback_wait_timeout_ms: 200, sticky_wait_timeout_ms: 200 },
+  })
+  repo.markCooldown('account-1', {
+    vmId: 'vm-01',
+    until: Date.now() + 20,
+    reason: 'provider_transient_error',
+  })
+  const selected = await pool.selectAndReserve({
+    model: 'claude-test',
+    excluded: new Set(['account-2']),
+    allowWait: true,
+  })
+  assert.equal(selected.ok, true)
+  assert.equal(selected.accountId, 'account-1')
+  selected.release()
+})
+
 test('busy slot waits for release instead of failing closed', async (t) => {
   const root = project()
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
@@ -2415,10 +2444,13 @@ function applyRebuildAttempt(callerSession, extra = {}) {
     const sessionId = resolveOutboundSessionId(callerSession, {
       mode: 'rebuild',
       officialClient: true,
+      accountId: extra.accountId || selected.accountId,
+      firstUserIdentity: extra.firstUserIdentity || '',
+      clientDiscriminator: extra.clientDiscriminator || '',
       boundSessionId: stickyBound?.sessionId || '',
       boundVmId: stickyBound?.vmId || '',
       vmId: selected.vmId,
-      epoch: extra.epoch ?? attemptExtra.attemptStartedAt ?? Date.now(),
+      epoch: extra.epoch ?? (attemptExtra.freshSlot ? attemptExtra.attemptStartedAt : 'pending'),
     })
     extra.seen?.push({ vmId: selected.vmId, sessionId })
     const identity = { deviceId: 'dev', accountUuid: 'acc', vmId: selected.vmId }
@@ -2481,6 +2513,39 @@ test('rebuild outbound session stays on one VM and changes after failover', asyn
   assert.equal(second.vmId, first.vmId)
   assert.equal(secondSeen[0].sessionId, seen[0].sessionId)
   assert.equal(sticky.resolve(stickyKey).sessionId, seen[0].sessionId)
+})
+
+test('consecutive turns without an inbound session keep one outbound session', async (t) => {
+  const root = project()
+  const sticky = new StickyRouter({ dataDir: path.join(root, 'data'), config: { sticky: { enabled: true } } })
+  t.after(() => {
+    try {
+      sticky.db?.close?.()
+    } catch {}
+    fs.rmSync(root, { recursive: true, force: true })
+  })
+  const pool = scheduler(root, { stickyRouter: sticky, accountQuota: { canAccept: () => ({ ok: true }) } })
+  const runner = new FailoverRunner({
+    scheduler: pool,
+    stickyRouter: sticky,
+    config: { same_account_retry_delay_ms: 0 },
+  })
+  const stickyKey = sticky.isolateKey('ch:same-opener', { apiKeyRecord: { id: 'key-1' } })
+  const seen = []
+  for (const requestId of ['turn-1', 'turn-2', 'turn-3']) {
+    const result = await runner.run({
+      requestId,
+      canonicalBody: { model: 'claude-opus-test' },
+      model: 'claude-opus-test',
+      stickyKey,
+      applyAttempt: applyRebuildAttempt('', { seen, accountId: 'acct-1', firstUserIdentity: 'same opener' }),
+      callAttempt: () => verifiedHop(requestId),
+    })
+    assert.equal(result.ok, true)
+  }
+  assert.equal(seen.length, 3)
+  assert.equal(seen[1].sessionId, seen[0].sessionId)
+  assert.equal(seen[2].sessionId, seen[0].sessionId)
 })
 
 test('family migration remints parent and child outbound sessions', async (t) => {

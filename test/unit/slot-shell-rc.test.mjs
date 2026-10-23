@@ -6,6 +6,8 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
   adoptShellLogin,
+  adoptLiveShellLogin,
+  createLiveLoginAdoption,
   createSlotShell,
   panelShellLaunch,
   syncShellLoginCredentials,
@@ -59,7 +61,7 @@ test('claude in the panel shell runs cli-node and points config at .claude', () 
   fs.rmSync(dir, { recursive: true, force: true })
 })
 
-test('official login runs only when the panel login marker is set', () => {
+test('official login starts claude only when the panel login marker is set', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'slot-shell-login-'))
   const bin = path.join(dir, 'cli-node')
   fs.writeFileSync(bin, '#!/bin/sh\necho "cli-node $*"\n', { mode: 0o755 })
@@ -75,9 +77,10 @@ test('official login runs only when the panel login marker is set', () => {
   const plain = run({})
   const login = run({ KIN_PANEL_LOGIN: '1' })
   assert.equal(plain.status, 0, plain.stderr)
-  assert.doesNotMatch(plain.stdout, /auth login/)
+  assert.doesNotMatch(plain.stdout, /cli-node/)
   assert.equal(login.status, 0, login.stderr)
-  assert.match(login.stdout, /cli-node auth login/)
+  assert.match(login.stdout, /cli-node\s*$/m)
+  assert.doesNotMatch(login.stdout, /auth login/)
   fs.rmSync(dir, { recursive: true, force: true })
 })
 
@@ -322,6 +325,125 @@ test('shell login is synced into the worker credential and the terminal keeps th
   }
 })
 
+test('a live interactive grant is imported once into the worker credential', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'slot-shell-live-'))
+  const home = path.join(root, 'vms', 'vm-02', 'cli-home')
+  const official = path.join(home, '.claude', '.credentials.json')
+  const worker = path.join(home, '.claude', 'credentials.json')
+  fs.mkdirSync(path.dirname(official), { recursive: true })
+  fs.writeFileSync(worker, '{}\n')
+  fs.symlinkSync('credentials.json', official)
+  const calls = []
+  const vm = { id: 'vm-02' }
+  const importer = async (input) => {
+    calls.push(input.oauth.refresh_token)
+    writeWorkerCredentialFile(home, input.oauth)
+    return { ok: true }
+  }
+  try {
+    const empty = await adoptLiveShellLogin(root, vm, { importOauth: importer })
+    assert.equal(empty.imported, false)
+    fs.writeFileSync(
+      official,
+      JSON.stringify({
+        claudeAiOauth: {
+          accessToken: 'at-live',
+          refreshToken: 'rt-live',
+          expiresAt: Date.now() + 3600_000,
+          scopes: ['user:profile', 'user:inference'],
+          email: 'live@example.com',
+          subscriptionType: 'max',
+        },
+      }),
+    )
+    const first = await adoptLiveShellLogin(root, vm, { importOauth: importer })
+    const second = await adoptLiveShellLogin(root, vm, {
+      importOauth: importer,
+      seen: first.refresh,
+    })
+    const stored = readWorkerCredentialFile(home)
+    assert.equal(first.imported, true)
+    assert.equal(second.imported, false)
+    assert.deepEqual(calls, ['rt-live'])
+    assert.equal(stored.refresh_token, 'rt-live')
+    assert.equal(stored.subscription_type, 'max')
+    assert.equal(fs.readlinkSync(official), 'credentials.json')
+    assert.equal(fs.realpathSync(official), fs.realpathSync(worker))
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('a cluster grant is pulled before an empty local file can hide it', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'slot-shell-live-node-'))
+  const home = path.join(root, 'vms', 'vm-07', 'cli-home')
+  const worker = path.join(home, '.claude', 'credentials.json')
+  fs.mkdirSync(path.dirname(worker), { recursive: true })
+  fs.writeFileSync(worker, '{}\n')
+  const calls = []
+  const host = {
+    kind: 'node',
+    afterRefresh: async () => {
+      calls.push('pull')
+      fs.writeFileSync(
+        worker,
+        JSON.stringify({
+          claudeAiOauth: {
+            accessToken: 'at-node',
+            refreshToken: 'rt-node',
+            expiresAt: Date.now() + 3600_000,
+            scopes: FULL_OAUTH_SCOPE.split(' '),
+            email: 'node@example.com',
+          },
+        }),
+      )
+    },
+  }
+  try {
+    const adopted = await adoptLiveShellLogin(
+      root,
+      { id: 'vm-07', node_id: 'node-a' },
+      {
+        loginHost: host,
+        importOauth: async (input) => {
+          calls.push(input.oauth.refresh_token)
+          writeWorkerCredentialFile(home, input.oauth)
+          return { ok: true }
+        },
+      },
+    )
+    assert.equal(adopted.imported, true)
+    assert.equal(adopted.refresh, 'rt-node')
+    assert.deepEqual(calls, ['pull', 'pull', 'rt-node'])
+    assert.equal(readWorkerCredentialFile(home).refresh_token, 'rt-node')
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('a slow interactive import is shared by the next tick and close', async () => {
+  let calls = 0
+  let release
+  const gate = new Promise((resolve) => {
+    release = resolve
+  })
+  const run = createLiveLoginAdoption({
+    adopt: async (seen) => {
+      calls += 1
+      await gate
+      return seen ? { imported: false, refresh: seen } : { imported: true, refresh: 'rt-1', seen }
+    },
+  })
+  const first = run()
+  const second = run(true)
+  assert.equal(second, first)
+  assert.equal(calls, 1)
+  release()
+  assert.deepEqual(await first, { imported: true, refresh: 'rt-1', seen: '' })
+  assert.deepEqual(await run(), { imported: false, refresh: 'rt-1' })
+  assert.equal(calls, 2)
+})
+
 test('official login tickets check a cluster slot for its container cli-node', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'slot-shell-ticket-'))
   fs.mkdirSync(path.join(root, 'vms'), { recursive: true })
@@ -487,5 +609,53 @@ test('panel shell 系统特征 still prints under sh -i fallback', () => {
   assert.equal(ran.status, 0, ran.stderr)
   assert.match(ran.stdout, /系统特征/)
   assert.match(ran.stdout, /机器ID\s+(已采集|未采集)/)
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
+test('panel shell 系统特征 reads the slot computer and cgroup limits before the host', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'slot-shell-facts-computer-'))
+  const home = path.join(dir, 'home')
+  const hw = path.join(dir, 'kin-hardware')
+  const dmi = path.join(dir, 'kin-dmi')
+  const cg = path.join(dir, 'cgroup')
+  for (const d of [home, hw, dmi, cg]) fs.mkdirSync(d)
+  fs.writeFileSync(path.join(hw, 'cpu_brand'), 'Persona CPU i5-1135G7\n')
+  fs.writeFileSync(path.join(hw, 'logical_cpus'), '8\n')
+  fs.writeFileSync(path.join(hw, 'ram_bytes'), '8589934592\n')
+  fs.writeFileSync(path.join(hw, 'mac'), '02:aa:bb:cc:dd:ee\n')
+  fs.writeFileSync(path.join(dmi, 'sys_vendor'), 'Dell Inc.\n')
+  fs.writeFileSync(path.join(dmi, 'product_name'), 'Inspiron 5502\n')
+  fs.writeFileSync(path.join(cg, 'cpu.max'), '150000 100000\n')
+  fs.writeFileSync(path.join(cg, 'memory.max'), '4294967296\n')
+  // The rc deletes itself after one session, so each run gets a fresh one.
+  const run = () => {
+    const rcPath = writeLaunchRc(dir)
+    return spawnSync('bash', ['--rcfile', rcPath, '-ic', 'true'], {
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        HOME: home,
+        KIN_PANEL_RCFILE: rcPath,
+        KIN_HW_DIR: hw,
+        KIN_DMI_DIR: dmi,
+        KIN_CGROUP_DIR: cg,
+        TERM: 'xterm',
+      },
+    })
+  }
+  let ran = run()
+  assert.equal(ran.status, 0, ran.stderr)
+  assert.match(ran.stdout, /CPU\s+Persona CPU i5-1135G7$/m)
+  assert.match(ran.stdout, /核数\s+2$/m)
+  assert.match(ran.stdout, /内存\s+4G$/m)
+  assert.match(ran.stdout, /MAC\s+02:aa:bb:cc:dd:ee$/m)
+  assert.match(ran.stdout, /厂商\s+Dell Inc\.$/m)
+  assert.match(ran.stdout, /产品\s+Inspiron 5502$/m)
+  fs.writeFileSync(path.join(cg, 'cpu.max'), 'max 100000\n')
+  fs.writeFileSync(path.join(cg, 'memory.max'), 'max\n')
+  ran = run()
+  assert.equal(ran.status, 0, ran.stderr)
+  assert.match(ran.stdout, /核数\s+8$/m)
+  assert.match(ran.stdout, /内存\s+8G$/m)
   fs.rmSync(dir, { recursive: true, force: true })
 })
