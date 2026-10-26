@@ -7,7 +7,8 @@ import { prepareOutboundHeaders } from '../protocol/outbound-attempt.mjs'
 import { sanitizeAnthropicBodyForBetaTokens } from '../protocol/anthropic-policy.mjs'
 import { withRequestProtocolBetas } from '../protocol/claude-code-betas.mjs'
 import { pinThreadBetas, rememberThreadTurn } from '../protocol/thread-betas.mjs'
-import { applyThinkingDisplay, thinkingDisplayMode } from '../protocol/thinking.mjs'
+import { applyThinkingDisplay, ensureOfficialPrintThinking, thinkingDisplayMode } from '../protocol/thinking.mjs'
+import { stripSubagentBilling } from '../identity/crs-persona.mjs'
 import { sealClaudeCodeCch } from '../identity/cch.mjs'
 import { credentialModeFromOauth } from '../oauth/credential-mode.mjs'
 import { isCrsMock, writeCrsTrace, mockCrsPayload, emitMockSse } from './crs-mock.mjs'
@@ -443,6 +444,7 @@ export function finalizeWorkerPayload({
   want1m = false,
   cliHop = false,
   requestContext = null,
+  repaired = false,
 } = {}) {
   const model = body?.model || ''
   const credMode = credentialModeFromOauth(exec?.vm?.claude || {})
@@ -451,18 +453,19 @@ export function finalizeWorkerPayload({
     want1m: want1m === true,
   })
   const displayed =
-    requestContext?.purpose === 'auto_mode_classifier' ? body : applyThinkingDisplay(body, thinkingDisplayMode(routing))
+    requestContext?.purpose === 'auto_mode_classifier' || repaired
+      ? body
+      : ensureOfficialPrintThinking(applyThinkingDisplay(body, thinkingDisplayMode(routing)))
+  const main = stripSubagentBilling(displayed)
   const thread = pinThreadBetas(
-    displayed,
-    withRequestProtocolBetas(String(headers?.['anthropic-beta'] || '').split(','), displayed),
+    main,
+    withRequestProtocolBetas(String(headers?.['anthropic-beta'] || '').split(','), main),
   )
   const betas = thread.betas
   headers['anthropic-beta'] = betas.join(',')
   // Envelope headers are discarded; the existing MessageRequest.betas channel
   // carries request gates to the native CLI, which builds the actual HTTP wire.
-  const gated = cliHop
-    ? { ...displayed, betas }
-    : sanitizeAnthropicBodyForBetaTokens(displayed, headers['anthropic-beta'])
+  const gated = cliHop ? { ...main, betas } : sanitizeAnthropicBodyForBetaTokens(main, headers['anthropic-beta'])
   return {
     headers,
     body: sealClaudeCodeCch(gated, { enabled: routing?.compatibility?.cch_enabled !== false, seal: !cliHop }),
@@ -483,6 +486,7 @@ function workerEnvelope({
   cacheTtl = null,
   preserveCacheBreakpoints = null,
   cliHop = false,
+  repaired = false,
 } = {}) {
   const finalized = finalizeWorkerPayload({
     body,
@@ -493,6 +497,7 @@ function workerEnvelope({
     want1m,
     cliHop,
     requestContext,
+    repaired,
   })
   const envelope = {
     ...(requestContext ? { request_context: requestContext } : {}),
@@ -542,6 +547,7 @@ export async function callGoWorker({
   requestPath = '/internal/v1/messages',
   envelope = null,
   cliHop = false,
+  repaired = false,
   onEnvelope = null,
 } = {}) {
   if (isCrsMock()) {
@@ -554,6 +560,7 @@ export async function callGoWorker({
       want1m,
       cliHop,
       requestContext,
+      repaired,
     })
     reportEnvelope(onEnvelope, { body: outboundBody, headers })
     writeCrsTrace({ body: outboundBody, headers, stream: false })
@@ -584,6 +591,7 @@ export async function callGoWorker({
           preserveCacheBreakpoints,
           cliHop,
           requestContext,
+          repaired,
         })
     reportEnvelope(onEnvelope, prepared.envelope)
     const response = await workerRequest(exec, {
@@ -652,7 +660,9 @@ export async function streamGoWorker({
   requestPath = '/internal/v1/messages',
   envelope = null,
   cliHop = false,
+  repaired = false,
   onEnvelope = null,
+  onOutboundHeaders = null,
 } = {}) {
   if (isCrsMock()) {
     const { body: outboundBody, headers } = finalizeWorkerPayload({
@@ -664,6 +674,7 @@ export async function streamGoWorker({
       want1m,
       cliHop,
       requestContext,
+      repaired,
     })
     reportEnvelope(onEnvelope, { body: outboundBody, headers })
     writeCrsTrace({ body: outboundBody, headers, stream: true })
@@ -758,6 +769,7 @@ export async function streamGoWorker({
           preserveCacheBreakpoints,
           cliHop,
           requestContext,
+          repaired,
         })
     reportEnvelope(onEnvelope, prepared.envelope)
     timing.mark('worker_dispatch_ms')
@@ -843,6 +855,7 @@ export async function streamGoWorker({
     let lastChunkAt = Date.now()
     let sawChunk = false
     let sawMessageStop = false
+    let outboundHeadersFrame = false
     let idleTimer = null
     if (firstByteMs > 0 || idleMs > 0) {
       idleTimer = setInterval(() => {
@@ -862,13 +875,37 @@ export async function streamGoWorker({
       // closes the response so a normal completion is not mistaken for cancel.
       for await (const chunk of response) {
         timing.mark('first_chunk_ms')
-        sawChunk = true
-        lastChunkAt = Date.now()
         buffer += Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk)
         let newline
         while ((newline = buffer.indexOf('\n')) >= 0) {
           const line = buffer.slice(0, newline).replace(/\r$/, '')
           buffer = buffer.slice(newline + 1)
+          // CLI diagnostics share the internal stream, never the caller's SSE.
+          if (line.startsWith('event:')) outboundHeadersFrame = line.slice(6).trim() === 'kin_outbound_headers'
+          if (outboundHeadersFrame) {
+            if (line.startsWith('data:')) {
+              const event = parseJson(line.slice(5).trim())
+              if (
+                event?.type === 'kin_outbound_headers' &&
+                event.headers &&
+                typeof event.headers === 'object' &&
+                !Array.isArray(event.headers) &&
+                typeof onOutboundHeaders === 'function'
+              ) {
+                try {
+                  onOutboundHeaders(event.headers)
+                } catch {
+                  console.warn('[worker] outbound header observer failed')
+                }
+              }
+            }
+            if (line === '') outboundHeadersFrame = false
+            continue
+          }
+          if (line) {
+            sawChunk = true
+            lastChunkAt = Date.now()
+          }
           applyClaudeSSELineToMessage(line, assembler)
           if (line.startsWith('data:')) {
             const piece = line.slice(5).trim()
@@ -891,8 +928,9 @@ export async function streamGoWorker({
           }
           await emitLine(line)
         }
+        if (sawChunk && !outboundHeadersFrame && buffer) lastChunkAt = Date.now()
       }
-      if (buffer) {
+      if (buffer && !outboundHeadersFrame) {
         applyClaudeSSELineToMessage(buffer, assembler)
         await emitLine(buffer)
       }
