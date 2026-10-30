@@ -1,52 +1,68 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { createStreamTiming, safeTiming } from '../../src/lib/transport/stream-timing.mjs'
-import { attemptDiagnostic } from '../../src/lib/protocol/attempt-diagnostic.mjs'
-test('monotonic timeline separates thinking and visible text without retaining content', () => {
-  let t = 100
-  const x = createStreamTiming(() => t)
-  x.mark('worker_dispatch_ms')
-  t = 120
-  x.mark('worker_headers_ms')
-  t = 130
-  x.observe({ type: 'message_start' })
-  assert.equal(x.snapshot().first_text_ms, null)
-  t = 140
-  x.observe({ type: 'content_block_delta', delta: { thinking: 'secret' } })
-  t = 180
-  x.observe({ type: 'content_block_delta', delta: { text: 'answer' } })
-  t = 200
-  x.observe({ type: 'content_block_delta', delta: { text: 'more' } })
-  const d = attemptDiagnostic(1, { timing: x.snapshot() })
-  assert.equal(d.timing.first_event_ms, 30)
-  assert.equal(d.timing.first_thinking_ms, 40)
-  assert.equal(d.timing.first_text_ms, 80)
-  assert.equal(d.timing.worker_dispatch_ms, 0)
-  assert.ok(!JSON.stringify(d).includes('secret'))
+import { createStreamTiming } from '../../src/lib/protocol/stream-timing.mjs'
+
+test('hidden reasoning uses the upstream window, not the short visible token tail', () => {
+  const timing = createStreamTiming(1_000)
+  timing.observe({ type: 'kin_outbound_headers', headers: {} }, 1_050)
+  timing.observe({ type: 'response.created' }, 1_200)
+  timing.observe({ type: 'response.output_item.added', item: { type: 'reasoning' } }, 1_300)
+  timing.observe({ type: 'response.output_text.delta', delta: 'answer' }, 16_565)
+  timing.observe({ type: 'response.completed', response: { usage: { output_tokens: 621 } } }, 16_688)
+  assert.deepEqual(timing.snapshot(), {
+    firstByteAt: 1_200,
+    firstByteMs: 200,
+    firstTokenAt: 16_565,
+    ttftMs: 15_565,
+    generationMs: 15_488,
+  })
+  assert.ok(621_000 / timing.snapshot().generationMs < 41)
 })
-test('empty events and signatures are not generated text', () => {
-  const x = createStreamTiming(() => 0)
-  x.observe({ type: 'content_block_delta', delta: { text: '', signature: 'secret' } })
-  assert.equal(x.snapshot().first_text_ms, null)
-  assert.equal(x.snapshot().first_thinking_ms, null)
-  x.observe({ type: 'content_block_delta', delta: { type: 'thinking_delta', estimated_tokens: 1 } })
-  assert.equal(x.snapshot().first_thinking_ms, 0)
+
+test('Claude output window stops before message_stop and transport cleanup', () => {
+  const timing = createStreamTiming(100)
+  timing.observe({ type: 'message_start' }, 200)
+  timing.observe({ type: 'content_block_start', content_block: { type: 'text', text: '' } }, 300)
+  timing.observe({ type: 'content_block_delta', delta: { type: 'text_delta', text: 'ok' } }, 1_200)
+  timing.observe({ type: 'message_delta', delta: { stop_reason: 'end_turn' } }, 2_200)
+  timing.observe({ type: 'message_stop' }, 9_200)
+  timing.observe({ type: 'content_block_delta', delta: { text: 'late invalid output' } }, 10_000)
+  assert.equal(timing.snapshot().ttftMs, 1_100)
+  assert.equal(timing.snapshot().firstByteMs, 100)
+  assert.equal(timing.snapshot().generationMs, 2_000)
 })
-test('Responses deltas and tool arguments have separate clocks', () => {
-  let t = 0
-  const x = createStreamTiming(() => t)
-  t = 10
-  x.observe({ type: 'response.reasoning_summary_text.delta', delta: 'a' })
-  t = 20
-  x.observe({ type: 'response.function_call_arguments.delta', delta: '{}' })
-  t = 30
-  x.observe({ type: 'response.output_text.delta', delta: 'b' })
-  assert.equal(x.snapshot().first_thinking_ms, 10)
-  assert.equal(x.snapshot().first_tool_ms, 20)
-  assert.equal(x.snapshot().first_text_ms, 30)
+
+test('metadata, empty blocks and signatures do not fabricate a first token', () => {
+  const timing = createStreamTiming(0)
+  timing.observe({ type: 'message_start' }, 100)
+  timing.observe({ type: 'content_block_start', content_block: { type: 'thinking', thinking: '' } }, 200)
+  timing.observe({ type: 'content_block_delta', delta: { type: 'signature_delta', signature: 'opaque' } }, 300)
+  timing.observe({ type: 'message_stop' }, 400)
+  assert.equal(timing.snapshot().ttftMs, null)
+  assert.equal(timing.snapshot().generationMs, null)
 })
-test('allowlist rejects invalid numeric values and arbitrary properties', () => {
-  const s = safeTiming({ first_text_ms: -1, first_tool_ms: Infinity, first_event_ms: '2', url: 'secret' })
-  assert.ok(Object.values(s).every((v) => v === null))
-  assert.ok(!JSON.stringify(s).includes('secret'))
+
+test('a single buffered packet or an interrupted stream cannot supply a measured rate', () => {
+  const buffered = createStreamTiming(0)
+  buffered.observe({ type: 'message_start' }, 100)
+  buffered.observe({ type: 'content_block_delta', delta: { text: 'ok' } }, 100)
+  buffered.observe({ type: 'message_stop' }, 100)
+  assert.equal(buffered.snapshot().ttftMs, 100)
+  assert.equal(buffered.snapshot().generationMs, null)
+  const interrupted = createStreamTiming(0)
+  interrupted.observe({ type: 'message_start' }, 100)
+  interrupted.observe({ type: 'content_block_delta', delta: { text: 'partial' } }, 200)
+  assert.equal(interrupted.snapshot().generationMs, null)
+})
+
+test('omitted thinking and generated tool names establish real first content', () => {
+  for (const event of [
+    { type: 'content_block_delta', delta: { type: 'thinking_delta', estimated_tokens: 50 } },
+    { type: 'content_block_start', content_block: { type: 'tool_use', name: 'Read' } },
+    { type: 'response.output_item.added', item: { type: 'function_call', name: 'Read' } },
+  ]) {
+    const timing = createStreamTiming(100)
+    timing.observe(event, 500)
+    assert.equal(timing.snapshot().ttftMs, 400)
+  }
 })

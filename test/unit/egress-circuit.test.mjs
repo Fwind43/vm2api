@@ -108,6 +108,7 @@ function fixture(t, { shared = false, slots = 2, maxConcurrency = 2 } = {}) {
     projectRoot: root,
     runtimeRepo: {
       get: () => null,
+      schedulingSnapshot: () => new Map(),
       upsert() {},
       clearExpired() {},
       clearRecoveredAuthCooldown() {},
