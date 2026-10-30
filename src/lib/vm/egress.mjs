@@ -12,6 +12,7 @@ import { getDb, isDbOpen } from '../db/database.mjs'
 import { SettingsRepo } from '../db/repos/settings-repo.mjs'
 import { socksProxyUrl } from './socks-address.mjs'
 import { assertProxyAllowed, proxyBlockedReason } from './proxy-policy.mjs'
+import { createEgressBridge } from './egress-network.mjs'
 
 export const EGRESS_BIN = process.env.KIN_EGRESS_BIN || '/opt/kin-gateway/bin/kin-egress'
 export const LOCAL_EGRESS_ID = 'px-local'
@@ -339,24 +340,13 @@ export function inspectEgressNetwork(proxyId, run = docker) {
   }
 }
 
-export function ensureEgressNetwork(proxyId, run = docker) {
+export function ensureEgressNetwork(proxyId, run = docker, runIp = (args) => sh(['ip', ...args])) {
   const name = networkName(proxyId)
   const br = bridgeName(proxyId)
   if (!name) return { ok: false, error: 'proxy_id_required' }
   const existing = inspectEgressNetwork(proxyId, run)
   if (existing?.subnet) return { ok: true, ...existing, reused: true }
-  const created = run([
-    'network',
-    'create',
-    '--ipv6=false',
-    '--opt',
-    `com.docker.network.bridge.name=${br}`,
-    '--opt',
-    'com.docker.network.bridge.enable_ip_masquerade=false',
-    '--opt',
-    'com.docker.network.bridge.enable_icc=false',
-    name,
-  ])
+  const created = createEgressBridge(name, br, { masquerade: false, runDocker: run, runIp })
   if (!created.ok && !/already exists/i.test(created.stderr || '')) {
     return { ok: false, error: created.stderr || 'docker network create failed' }
   }
@@ -752,25 +742,14 @@ function waitListen(host, port, timeoutMs = 8000, ownerPid = 0) {
   return false
 }
 
-export function ensureLocalProxyEgress(proxy, { runDocker = docker } = {}) {
+export function ensureLocalProxyEgress(proxy, { runDocker = docker, runIp = (args) => sh(['ip', ...args]) } = {}) {
   const proxyId = proxy?.id || LOCAL_EGRESS_ID
   const name = networkName(proxyId)
   const br = bridgeName(proxyId)
   if (!name) return { ok: false, error: 'proxy_id_required' }
   const existing = inspectEgressNetwork(proxyId, runDocker)
   if (existing?.subnet) return { ok: true, mode: 'local', ...existing, reused: true, proxy_id: proxyId }
-  const created = runDocker([
-    'network',
-    'create',
-    '--ipv6=false',
-    '--opt',
-    `com.docker.network.bridge.name=${br}`,
-    '--opt',
-    'com.docker.network.bridge.enable_ip_masquerade=true',
-    '--opt',
-    'com.docker.network.bridge.enable_icc=false',
-    name,
-  ])
+  const created = createEgressBridge(name, br, { masquerade: true, runDocker, runIp })
   if (!created.ok && !/already exists/i.test(created.stderr || '')) {
     return { ok: false, error: created.stderr || 'docker network create failed' }
   }
@@ -798,7 +777,7 @@ export async function runExclusiveProxyEgress(projectRoot, proxyId, fn) {
 }
 
 export async function ensureProxyEgress(projectRoot, proxy, opts = {}) {
-  if (isLocalEgressProxy(proxy)) return ensureLocalProxyEgress(proxy, { runDocker: opts.runDocker })
+  if (isLocalEgressProxy(proxy)) return ensureLocalProxyEgress(proxy, opts)
   return runExclusiveProxyEgress(projectRoot, proxy?.id, () => startProxyEgress(projectRoot, proxy, opts))
 }
 
@@ -807,6 +786,7 @@ export async function startProxyEgress(
   proxy,
   {
     runDocker = docker,
+    runIp = (args) => sh(['ip', ...args]),
     runIptables = iptables,
     dnsUpstream = configuredDnsUpstream(),
     dnsEmptyTypes = configuredDnsEmptyTypes(),
@@ -820,7 +800,7 @@ export async function startProxyEgress(
   const proxyId = proxy?.id
   const proxyUrl = boundProxyUrl(proxy)
   if (!proxyId || !proxyUrl) return { ok: false, error: 'bound SOCKS5 id and url required; refusing fallback' }
-  const net = ensureEgressNetwork(proxyId, runDocker)
+  const net = ensureEgressNetwork(proxyId, runDocker, runIp)
   if (!net.ok) return net
   const listenHost = listenHostOverride || net.gateway || gatewayFromSubnet(net.subnet)
   if (!listenHost) return { ok: false, error: 'egress network gateway missing' }
