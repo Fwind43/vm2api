@@ -60,6 +60,7 @@ test('risk-audit and request-level codes never change the slot state', () => {
     'slot_busy',
     'concurrency_limit',
     'model_cooldown',
+    'pool_egress_unavailable',
   ]
   for (const code of stateless) assert.equal(stateOfReason(code)?.state, 'on', code)
 })
@@ -89,6 +90,7 @@ test('deterministic failures are 不可调度, self-healing ones are 受限', ()
     'circuit_open',
     'provider_overloaded',
     'proxy_transport_failure',
+    'egress_unavailable',
     'node_offline',
     'kernel_faulted',
     'maintenance',
