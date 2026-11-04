@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto'
 
-const POOL_EXHAUSTED = /all predefined address pools have been fully subnetted|could not find an available, non-overlapping IPv4 address pool among the defaults/i
+const POOL_EXHAUSTED =
+  /all predefined address pools have been fully subnetted|could not find an available, non-overlapping IPv4 address pool among the defaults/i
 const OVERLAP = /pool overlaps with other one on this address space|invalid pool request.*overlap/i
 const MAX_CREATE_ATTEMPTS = 4
 
@@ -31,7 +32,10 @@ function readArray(result, label) {
 function occupiedRanges(runDocker, runIp) {
   const listed = runDocker(['network', 'ls', '-q'])
   if (!listed.ok) throw new Error(`docker network inventory: ${listed.stderr || 'command failed'}`)
-  const ids = String(listed.stdout || '').trim().split(/\s+/).filter(Boolean)
+  const ids = String(listed.stdout || '')
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean)
   if (!ids.length || ids.some((id) => !/^[a-f\d]{12,64}$/i.test(id))) {
     throw new Error('docker network inventory: missing or invalid network IDs')
   }
@@ -90,10 +94,15 @@ function selectSubnet(name, ranges) {
  */
 export function createEgressBridge(name, bridge, { masquerade, runDocker, runIp }) {
   const base = [
-    'network', 'create', '--ipv6=false',
-    '--opt', `com.docker.network.bridge.name=${bridge}`,
-    '--opt', `com.docker.network.bridge.enable_ip_masquerade=${masquerade}`,
-    '--opt', 'com.docker.network.bridge.enable_icc=false',
+    'network',
+    'create',
+    '--ipv6=false',
+    '--opt',
+    `com.docker.network.bridge.name=${bridge}`,
+    '--opt',
+    `com.docker.network.bridge.enable_ip_masquerade=${masquerade}`,
+    '--opt',
+    'com.docker.network.bridge.enable_icc=false',
   ]
   const first = runDocker([...base, name])
   if (first.ok || !POOL_EXHAUSTED.test(`${first.stderr || ''}\n${first.stdout || ''}`)) return first
@@ -104,8 +113,15 @@ export function createEgressBridge(name, bridge, { masquerade, runDocker, runIp 
       last = runDocker([...base, '--subnet', subnet, '--gateway', gateway, name])
       if (last.ok || !OVERLAP.test(`${last.stderr || ''}\n${last.stdout || ''}`)) return last
     }
-    return { ...last, ok: false, stderr: `egress subnet allocation raced ${MAX_CREATE_ATTEMPTS} times: ${last.stderr || ''}` }
+    return {
+      ...last,
+      ok: false,
+      stderr: `egress subnet allocation raced ${MAX_CREATE_ATTEMPTS} times: ${last.stderr || ''}`,
+    }
   } catch (error) {
-    return { ok: false, stderr: `egress address-pool fallback refused: ${error.message}; original: ${first.stderr || first.stdout || ''}` }
+    return {
+      ok: false,
+      stderr: `egress address-pool fallback refused: ${error.message}; original: ${first.stderr || first.stdout || ''}`,
+    }
   }
 }

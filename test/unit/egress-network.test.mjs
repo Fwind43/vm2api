@@ -7,7 +7,14 @@ const exhausted = { ok: false, stderr: 'all predefined address pools have been f
 const success = (value) => ({ ok: true, stdout: JSON.stringify(value), stderr: '' })
 const noIp = () => assert.fail('host inventory must not run')
 
-function fixture({ routes = [{ dst: 'default' }], addresses, networks, inventoryError, collisions = 0, createError } = {}) {
+function fixture({
+  routes = [{ dst: 'default' }],
+  addresses,
+  networks,
+  inventoryError,
+  collisions = 0,
+  createError,
+} = {}) {
   const dockerCalls = []
   const ipCalls = []
   const raced = []
@@ -22,10 +29,16 @@ function fixture({ routes = [{ dst: 'default' }], addresses, networks, inventory
     }
     if (args[1] === 'inspect') {
       if (inventoryError) return inventoryError
-      return success(inventory.map((n, i) => i ? n : {
-        ...n,
-        IPAM: { ...n.IPAM, Config: [...(n.IPAM?.Config || []), ...raced.map((Subnet) => ({ Subnet }))] },
-      }))
+      return success(
+        inventory.map((n, i) =>
+          i
+            ? n
+            : {
+                ...n,
+                IPAM: { ...n.IPAM, Config: [...(n.IPAM?.Config || []), ...raced.map((Subnet) => ({ Subnet }))] },
+              },
+        ),
+      )
     }
     assert.equal(args[1], 'create')
     if (!args.includes('--subnet')) return exhausted
@@ -53,9 +66,17 @@ const create = (f, masquerade = false) => createEgressBridge('kin-eg-px-test', '
 test('normal Docker allocation is unchanged and does not read host inventory', () => {
   const result = { ok: true, stdout: 'normal-network' }
   const calls = []
-  assert.equal(createEgressBridge('net', 'br', {
-    masquerade: false, runIp: noIp, runDocker: (args) => { calls.push(args); return result },
-  }), result)
+  assert.equal(
+    createEgressBridge('net', 'br', {
+      masquerade: false,
+      runIp: noIp,
+      runDocker: (args) => {
+        calls.push(args)
+        return result
+      },
+    }),
+    result,
+  )
   assert.equal(calls.length, 1)
   assert.ok(!calls[0].includes('--subnet'))
 })
@@ -71,17 +92,27 @@ test('pool exhaustion selects explicit subnet, preserves bridge isolation and us
   const [args] = f.explicit()
   assert.match(args[args.indexOf('--subnet') + 1], /^10\.203\.\d+\.0\/24$/)
   assert.equal(args[args.indexOf('--gateway') + 1], args[args.indexOf('--subnet') + 1].replace('.0/24', '.1'))
-  for (const option of ['--ipv6=false', 'com.docker.network.bridge.name=kegtest', 'com.docker.network.bridge.enable_ip_masquerade=false', 'com.docker.network.bridge.enable_icc=false']) assert.ok(args.includes(option))
-  assert.deepEqual(f.ipCalls, [['-j', '-4', 'route', 'show', 'table', 'all'], ['-j', '-4', 'address', 'show']])
+  for (const option of [
+    '--ipv6=false',
+    'com.docker.network.bridge.name=kegtest',
+    'com.docker.network.bridge.enable_ip_masquerade=false',
+    'com.docker.network.bridge.enable_icc=false',
+  ])
+    assert.ok(args.includes(option))
+  assert.deepEqual(f.ipCalls, [
+    ['-j', '-4', 'route', 'show', 'table', 'all'],
+    ['-j', '-4', 'address', 'show'],
+  ])
   assert.ok(f.dockerCalls.every((a) => a[0] === 'network' && ['create', 'ls', 'inspect'].includes(a[1])))
 })
 
 test('the alternative Docker exhaustion message also enables fallback', () => {
   const f = fixture()
   const runDocker = f.runDocker
-  f.runDocker = (args) => args[1] === 'create' && !args.includes('--subnet')
-    ? { ok: false, stderr: 'could not find an available, non-overlapping IPv4 address pool among the defaults' }
-    : runDocker(args)
+  f.runDocker = (args) =>
+    args[1] === 'create' && !args.includes('--subnet')
+      ? { ok: false, stderr: 'could not find an available, non-overlapping IPv4 address pool among the defaults' }
+      : runDocker(args)
   assert.equal(create(f).ok, true)
   assert.equal(f.explicit().length, 1)
 })
@@ -160,9 +191,8 @@ test('a non-overlap create error is returned without retry', () => {
 for (const local of [false, true]) {
   test(`${local ? 'local' : 'remote'} ensure reuses persistent state on second call`, () => {
     const f = fixture()
-    const ensure = () => local
-      ? ensureLocalProxyEgress({ id: 'px-local' }, f)
-      : ensureEgressNetwork('px-test', f.runDocker, f.runIp)
+    const ensure = () =>
+      local ? ensureLocalProxyEgress({ id: 'px-local' }, f) : ensureEgressNetwork('px-test', f.runDocker, f.runIp)
     const first = ensure()
     assert.equal(first.ok, true)
     assert.equal(first.reused, false)
