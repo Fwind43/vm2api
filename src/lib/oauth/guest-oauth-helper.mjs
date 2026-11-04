@@ -5,7 +5,7 @@ import { slotHost } from '../vm/slot-host.mjs'
 import { slotExecArgv } from '../vm/slot-exec.mjs'
 import { slotExec, startSlotReady } from '../vm/slot-runtime.mjs'
 import { getVm, patchVmRecord } from '../vm/vm-registry.mjs'
-import { hasBoundExit, isLocalEgressProxy, boundProxyUrl } from '../vm/egress.mjs'
+import { hasBoundExit } from '../vm/egress.mjs'
 import { proxyBlockedReason } from '../vm/proxy-policy.mjs'
 import { postRustKernelTelemetryEvent, rustKernelPaths } from '../transport/rust-kernel-client.mjs'
 import { runSlotProcess } from '../transport/slot-oauth.mjs'
@@ -37,13 +37,17 @@ export async function prepareSlotOAuth({
     throw fail(blocked || 'proxy_required', 'OAuth requires the target VM bound egress')
   }
   const boot = await startReady(vm, projectRoot, { routing, allowMissingCredential: true, timeoutMs })
+  // startSlotReady nests the kernel result: boot.rust = { ok, engine, rust: { ok, reason, health } }.
+  // startReady is injectable, so accept a flat boot.rust.health as well.
+  const kernel = boot?.rust?.rust || boot?.rust
+  const health = kernel?.health || boot?.rust?.health
   if (
     !boot?.ok ||
     boot.rust_ok === false ||
     !boot.rust?.ok ||
     boot.rust.skipped ||
-    boot.rust.health?.vm_telemetry !== true ||
-    boot.rust.health?.telemetry_ready !== true
+    health?.vm_telemetry !== true ||
+    health?.telemetry_ready !== true
   ) {
     throw fail(boot?.rust?.code || boot?.code || 'oauth_runtime_not_ready', 'Target VM native CLI is not ready')
   }
@@ -141,15 +145,15 @@ export async function runGuestOAuthAuthService(
   }
   await record('start')
   try {
-    // Controller proxyUrl may point at a loopback SSH forwarder. Never pass it
-    // into a guest: select the VM's binding, including explicit local egress.
+    // Linux slots join a kin-eg-* transparent network. A proxy URL may be a
+    // controller-local forwarder and is not reachable from inside the guest.
     const result = await runDocker(argv, {
       env: host.dockerEnv(),
       timeoutMs: Math.max(timeoutMs * 8, 45000),
       stdin:
         JSON.stringify({
           ...payload,
-          proxy_url: isLocalEgressProxy(exec.vm.proxy) ? '' : boundProxyUrl(exec.vm.proxy),
+          proxy_url: '',
         }) + '\n',
     })
     if (result?.timed_out) throw fail('oauth_auth_timeout', 'Target VM OAuth helper timed out')

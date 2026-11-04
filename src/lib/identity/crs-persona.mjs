@@ -439,10 +439,17 @@ export function ccEntrypointFromRouting(routing) {
   return routing?.compatibility?.cc_entrypoint === 'sdk-cli' ? 'sdk-cli' : 'cli'
 }
 
-/** Add the billing block exactly once before the cli-node hop. */
+/** Add the project billing block when none is present. Do not replace one the template already wrote. */
 export function ensureBillingAttribution(
   body,
-  { firstUserText = '', cliVersion = DEFAULT_CLI_VERSION, sessionId = '', indexes = null, entrypoint = 'cli' } = {},
+  {
+    firstUserText = '',
+    cliVersion = DEFAULT_CLI_VERSION,
+    sessionId = '',
+    indexes = null,
+    entrypoint = 'cli',
+    passthrough = false,
+  } = {},
 ) {
   if (!body || typeof body !== 'object') return body
   const hasBilling = (system) => {
@@ -450,7 +457,7 @@ export function ensureBillingAttribution(
     if (!Array.isArray(system)) return false
     return system.some((block) => /x-anthropic-billing-header:/i.test(String(block?.text || block || '')))
   }
-  if (hasBilling(body.system)) return body
+  if (passthrough || hasBilling(body.system)) return body
   const block = {
     type: 'text',
     text: buildBillingAttributionText(firstUserText, cliVersion, sessionId, indexes, entrypoint),
@@ -1727,6 +1734,11 @@ export function officialCcPassthroughFromRouting(routing = {}) {
   return routing?.compatibility?.official_cc_passthrough === true
 }
 
+/** Recognition is not passthrough. The body is kept only when that switch is on. */
+export function officialFamilyBodyPassthrough(officialTraffic, routing = {}) {
+  return officialTraffic === true && officialCcPassthroughFromRouting(routing)
+}
+
 function stripSystemCacheControl(body) {
   if (!Array.isArray(body.system)) return body
   let changed = false
@@ -2151,7 +2163,11 @@ function applyTemplatePersona(
       // expansions as blocks so the assembled cache merger can budget them.
       system = [...system, ...(Array.isArray(content) ? content : [{ type: 'text', text: content }])]
     } else if (content.length) {
-      const at = outMessages.findLastIndex((message) => message?.role === 'user')
+      // Official presets anchor to the first user turn: callers resend history
+      // without this injected block, so a tail position shifts every turn and
+      // breaks the cache prefix from that point on. Zero templates keep the
+      // caller-visible tail placement.
+      const at = zero ? outMessages.findLastIndex((message) => message?.role === 'user') : firstUserIndex(outMessages)
       if (at >= 0)
         outMessages = [...outMessages.slice(0, at + 1), { role: 'system', content }, ...outMessages.slice(at + 1)]
     }
@@ -2189,7 +2205,9 @@ export function applyCrsUnofficialPersona(
   } = {},
 ) {
   if (!body || typeof body !== 'object') return body
-  if (!forceConfigured && (officialClient || isOfficialClaudeCodeTraffic(headers || {}, body))) return body
+  // Looking like Claude Code is not passthrough. The handler sets officialClient
+  // only when routing.compatibility.official_cc_passthrough is on.
+  if (!forceConfigured && officialClient) return body
   const fromFile = routingFile ? personaOptionsFromRoutingFile(routingFile) : null
   const resolved = normalizePersonaMode(mode ?? fromFile?.mode)
   // Read the caller's agent prompt before stripLeakySystem drops it as known official text.
