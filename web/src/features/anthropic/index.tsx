@@ -3,7 +3,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { VIEW_TITLES } from '@/config/nav'
 import { toast } from 'sonner'
 import { api } from '@/lib/api'
-import { cn } from '@/lib/utils'
+import { cn, randomUUID } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import {
@@ -44,7 +44,7 @@ type ModelList = {
 
 function freshEndpoint(): EndpointDraft {
   return {
-    id: crypto.randomUUID(),
+    id: randomUUID(),
     baseUrl: DEFAULT_URL,
     authScheme: 'x_api_key',
     apiKey: '',

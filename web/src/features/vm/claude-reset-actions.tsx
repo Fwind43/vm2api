@@ -4,7 +4,7 @@ import type { Vm } from '@/types/panel-vm'
 import { RefreshCw, RotateCcw } from 'lucide-react'
 import { toast } from 'sonner'
 import { api } from '@/lib/api'
-import { cn } from '@/lib/utils'
+import { cn, randomUUID } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { ConfirmDialog } from '@/components/confirm-dialog'
 import { dashboardQueryOptions } from '@/features/overview/queries'
@@ -113,7 +113,7 @@ function useClaudeResetActions(vm: Vm) {
 
   const openConfirm = () => {
     if (!keyRef.current) {
-      keyRef.current = `claude-reset-${vm.id}-${crypto.randomUUID()}`
+      keyRef.current = `claude-reset-${vm.id}-${randomUUID()}`
     }
     setConfirm(true)
   }
