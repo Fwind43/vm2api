@@ -211,14 +211,13 @@ function byVmHas(candidates, vmId) {
 }
 
 /**
- * Nothing eligible. Fable keeps its Max gate; otherwise an upstream cooldown on
- * the dropped accounts names the cause: any 529 overload cooldown is capacity
- * (529), only 429 rate-limit cooldowns are the provider's limit (429). Without
- * either, nothing will come back by waiting (503) — unless every slot is just
- * inside its operator rest window, whose open time rides along as retry_after.
+ * Nothing eligible. An upstream cooldown on the dropped accounts names the
+ * cause: any 529 overload cooldown is capacity (529), only 429 rate-limit
+ * cooldowns are the provider's limit (429). Without either, nothing will come
+ * back by waiting (503) — unless every slot is just inside its operator rest
+ * window, whose open time rides along as retry_after.
  */
-function emptyPoolFailure(model, candidates, now = Date.now()) {
-  if (isFableModel(model)) return { reason: 'fable_requires_max', retry_after_ms: null }
+function emptyPoolFailure(_model, candidates, now = Date.now()) {
   if ((candidates?.rejections?.quota_guard_request_too_large || 0) > 0) {
     return { reason: 'quota_guard_request_too_large', retry_after_ms: null }
   }
