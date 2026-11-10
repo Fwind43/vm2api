@@ -227,8 +227,8 @@ describe('health probe must not paint a live ticket unavailable', () => {
   })
 })
 
-describe('claudeTier follows usage Fable presence', () => {
-  it('treats usage Fable as Max even when stored Pro and hop denied', () => {
+describe('claudeTier preserves stored subscription tier', () => {
+  it('preserves stored Pro even when usage has Fable and hop denied', () => {
     expect(
       claudeTier(
         liveVm({
@@ -237,10 +237,10 @@ describe('claudeTier follows usage Fable presence', () => {
           fable: { plan_denied: true, ok: false, status: 403 },
         })
       ).key
-    ).toBe('max')
+    ).toBe('pro')
   })
 
-  it('treats a real 7d_oi window as Max over stored Pro', () => {
+  it('preserves stored Pro even when a real 7d_oi window is present', () => {
     expect(
       claudeTier(
         liveVm({
@@ -249,7 +249,7 @@ describe('claudeTier follows usage Fable presence', () => {
           reset_7d_oi: '2026-08-24T00:00:00Z',
         })
       ).key
-    ).toBe('max')
+    ).toBe('pro')
   })
 
   it('keeps Pro when usage has no Fable evidence', () => {
