@@ -93,11 +93,11 @@ test('the slot file and the panel summary produce the same key', () => {
   assert.equal(scopeKeyOf(summary), 'gpt:plus')
   const untiered = scopeAccountFromVm({ id: 'vm-04', platform: 'anthropic', claude: { has_access: true } })
   assert.equal(scopeKeyOf(untiered), 'claude:pro')
-  const maxByUsage = scopeAccountFromVm(
+  const proWithFable = scopeAccountFromVm(
     { id: 'vm-06', platform: 'anthropic', has_token: true, account_tier: 'pro' },
     { usage_has_fable: true },
   )
-  assert.equal(scopeKeyOf(maxByUsage), 'claude:max')
+  assert.equal(scopeKeyOf(proWithFable), 'claude:pro')
 
   const inventory = buildScopeInventory(
     [
