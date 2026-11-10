@@ -561,6 +561,7 @@ test('clearGrantRevokeLeftover keeps stored Max off leftover Fable revoke', () =
     ok: true,
     usage_status: 200,
     limits_present: true,
+    account_tier: 'max',
     usage_has_fable: true,
     five_hour: { utilization: 0, status: 'allowed' },
     seven_day: { utilization: 0, status: 'allowed' },
@@ -640,7 +641,7 @@ test('official usage without Fable hop does not turn leftover 429 into Pro', () 
   assert.equal(acc.unified.account_tier, undefined)
 })
 
-test('Fable hop alone does not classify Pro; complete usage can flip stored Pro to Max', () => {
+test('Fable hop alone does not classify Pro; complete usage preserves stored Pro while clearing Fable denial', () => {
   const q = new AccountQuota({
     dataDir: tmpDir(),
     config: { quota: { safety_ratio: 0.95, block_on_5h: true, block_on_7d: true } },
@@ -667,7 +668,7 @@ test('Fable hop alone does not classify Pro; complete usage can flip stored Pro 
     probed_at: '2026-08-24T00:00:00Z',
   })
   const acc = q.repo.get('acc-mispro')
-  assert.equal(acc.unified.account_tier, 'max')
+  assert.equal(acc.unified.account_tier, 'pro')
   assert.equal(acc.unified.usage_has_fable, true)
   assert.equal(acc.unified.fable.plan_denied, false)
   assert.equal(acc.unified.fable.ok, true)
@@ -1230,7 +1231,7 @@ test('elapsed header reset wipes Extra and becomes schedulable', () => {
   assert.equal(saved.unified.headers['5h'].status, 'active')
 })
 
-test('complete usage may replace a profile-sourced tier', async () => {
+test('complete usage may replace a profile-sourced tier when explicit tier is provided', async () => {
   const quota = new AccountQuota({ dataDir: tmpDir(), config: {} })
   quota.ensure({ account_id: 'acct-profile', vm_id: 'vm-01' })
   quota.setAccountTier('acct-profile', 'pro', { source: 'profile' })
@@ -1240,6 +1241,16 @@ test('complete usage may replace a profile-sourced tier', async () => {
     ok: true,
     usage_status: 200,
     limits_present: true,
+    usage_has_fable: true,
+    seven_day_oi: { utilization: 0.2, resets_at: '2026-09-30T00:00:00Z' },
+  })
+  assert.equal(quota.repo.get('acct-profile').unified.account_tier, 'pro')
+  assert.equal(quota.repo.get('acct-profile').unified.account_tier_source, 'profile')
+  quota.ingestOAuthUsage('acct-profile', {
+    ok: true,
+    usage_status: 200,
+    limits_present: true,
+    account_tier: 'max',
     usage_has_fable: true,
     seven_day_oi: { utilization: 0.2, resets_at: '2026-09-30T00:00:00Z' },
   })

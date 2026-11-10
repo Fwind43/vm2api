@@ -390,10 +390,13 @@ export class AccountQuota {
       delete acc.unified.fable
     }
     if (completeOfficialUsage) {
-      if (probe.usage_has_fable === true || hasFableUsage) acc.unified.account_tier = 'max'
-      else if (probe.usage_has_fable === false) acc.unified.account_tier = 'pro'
-      if (acc.unified.account_tier === 'pro' || acc.unified.account_tier === 'max')
+      if (probe.account_tier === 'max' || probe.account_tier === 'pro') {
+        acc.unified.account_tier = probe.account_tier
         acc.unified.account_tier_source = 'usage'
+      } else if (probe.usage_has_fable === false) {
+        acc.unified.account_tier = 'pro'
+        acc.unified.account_tier_source = 'usage'
+      }
     }
     if (probe.fable && !fableTransport) {
       const planDenied = completeOfficialUsage && !hasFableUsage && isFablePlanDenied(probe.fable)
@@ -409,16 +412,9 @@ export class AccountQuota {
         error: usageOk && Number(probe.fable.status) === 401 ? null : probe.fable.error || null,
         probed_at: probe.probed_at || new Date().toISOString(),
       }
-      // Only a complete official /usage classifies the plan; Fable hop only fills metadata.
-      if (completeOfficialUsage && hasFableUsage) {
-        acc.unified.account_tier = 'max'
-        acc.unified.account_tier_source = 'usage'
-      }
     } else if (usageOk) {
       const leftover = leftoverFable
       if (completeOfficialUsage && hasFableUsage) {
-        acc.unified.account_tier = 'max'
-        acc.unified.account_tier_source = 'usage'
         if (leftover.plan_denied || leftover.ok === false) {
           acc.unified.fable = {
             ...leftover,

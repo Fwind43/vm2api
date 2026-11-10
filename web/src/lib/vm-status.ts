@@ -724,15 +724,7 @@ export function claudeTier(vm: Vm | undefined): StatusTone {
   if (vm.usage_has_fable === false)
     return { key: 'pro', label: 'Pro', cls: 'pro', text: 'Pro' }
   const raw = String(vm.account_tier || '').toLowerCase()
-  const oi = vm.utilization_7d_oi
-  const oiN =
-    oi == null ? null : Number(oi) > 1.5 ? Number(oi) / 100 : Number(oi)
-  const realFable =
-    vm.usage_has_fable === true ||
-    (oiN != null && Boolean(vm.reset_7d_oi || oiN < 1))
-  // Usage 里有 Fable 就是 Max。落盘 pro / hop 403 不能盖掉。
-  // 没有套餐证据时不要画成 Pro，否则 Max 探测未完成的槽会一直显示 Pro。
-  if (realFable || raw === 'max')
+  if (raw === 'max')
     return { key: 'max', label: 'Max', cls: 'max', text: 'Max' }
   if (raw === 'pro')
     return { key: 'pro', label: 'Pro', cls: 'pro', text: 'Pro' }

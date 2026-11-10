@@ -39,7 +39,7 @@ export function inferClaudeTier(vm = {}, quota = {}) {
   const q = quotaView(vm, quota)
   if (q.usage_has_fable === false) return { key: 'pro', label: 'Pro' }
   const stored = String(vm.account_tier || quota.account_tier || '').toLowerCase()
-  if (hasClaudeFableUsage(vm, quota) || stored === 'max') {
+  if (stored === 'max') {
     return { key: 'max', label: 'Max' }
   }
   if (stored === 'pro') {

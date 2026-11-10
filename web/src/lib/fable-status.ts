@@ -115,7 +115,7 @@ export function fableUsedOf(
 ): number | null {
   const fb = (subject.fable as Record<string, unknown> | undefined) || {}
   if (
-    tierKey === 'pro' ||
+    subject.usage_has_fable === false ||
     fablePlanDenied(fb) ||
     inventedFableWindow(subject)
   ) {
@@ -123,6 +123,7 @@ export function fableUsedOf(
   }
   if (subject.utilization_7d_oi != null)
     return Number(subject.utilization_7d_oi)
+  if (tierKey === 'pro') return null
   if (fb.utilization != null) return Number(fb.utilization)
   return null
 }
@@ -145,7 +146,12 @@ export function fableProbeLabel(
   tierKey: string
 ): string {
   const fb = subject.fable as Record<string, unknown> | undefined
-  if (tierKey === 'pro') return 'Pro 无 Fable'
+  if (
+    tierKey === 'pro' &&
+    subject.usage_has_fable !== true &&
+    fableUsedOf(subject, tierKey) == null
+  )
+    return 'Pro 无 Fable'
   // 落盘 Max 但 Fable 被拒：套餐没带 Fable 权限，不是 Pro。
   if (fablePlanDenied(fb)) return '无 Fable 权限'
   if (!fb) return '未探测'

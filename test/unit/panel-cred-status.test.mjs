@@ -441,10 +441,10 @@ test('leftover oauth_no_refresh out of pool is unavailable', () => {
   assert.equal(st.text, '无效凭证')
 })
 
-test('Claude token defaults to Pro until Fable usage upgrades it', () => {
+test('Claude token uses stored account_tier and does not upgrade Pro from Fable usage', () => {
   assert.equal(inferClaudeTier({}).key, 'none')
   assert.equal(inferClaudeTier({ has_token: true }, { fable: { plan_denied: true, status: 403 } }).key, 'pro')
-  assert.equal(inferClaudeTier({ has_token: true, utilization_7d_oi: 0.21 }).key, 'max')
+  assert.equal(inferClaudeTier({ has_token: true, utilization_7d_oi: 0.21 }).key, 'pro')
   assert.equal(inferClaudeTier({ has_token: true, fable: { ok: true } }).key, 'pro')
   assert.equal(
     inferClaudeTier({ has_token: true }, { fable: { plan_denied: true, status: 401, error: 'plan_denied' } }).key,
@@ -471,7 +471,7 @@ test('Claude token defaults to Pro until Fable usage upgrades it', () => {
         reset_7d_oi: '2026-08-24T00:00:00Z',
       },
     ).key,
-    'max',
+    'pro',
   )
   assert.equal(inferClaudeTier({ has_token: true, account_tier: 'pro' }).key, 'pro')
   assert.equal(inferClaudeTier({ has_token: true, account_tier: 'max' }).key, 'max')
@@ -489,14 +489,14 @@ test('Claude token defaults to Pro until Fable usage upgrades it', () => {
       { has_token: true, account_tier: 'pro' },
       { utilization_7d_oi: 0.21, reset_7d_oi: '2026-08-24T00:00:00Z' },
     ).key,
-    'max',
+    'pro',
   )
   assert.equal(
     inferClaudeTier(
       { has_token: true, account_tier: 'pro' },
       { usage_has_fable: true, fable: { plan_denied: true, ok: false, status: 403 } },
     ).key,
-    'max',
+    'pro',
   )
   assert.equal(inferClaudeTier({ has_token: true }).key, 'pro')
 })

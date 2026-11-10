@@ -112,9 +112,9 @@ export type FableRow =
  */
 export function fableRow(vm: Vm): FableRow | null {
   const tier = claudeTier(vm)
-  if (tier.key !== 'max') return null
+  if (tier.key === 'none' || tier.key === 'codex') return null
   const st = fableState(vm, tier.key)
   if (st.usedPct != null) return { kind: 'bar', pct: st.usedPct }
-  if (st.tone.key === 'none') return null
+  if (tier.key !== 'max' || st.tone.key === 'none') return null
   return { kind: 'note', text: st.tone.text }
 }

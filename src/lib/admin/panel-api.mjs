@@ -1239,7 +1239,12 @@ export async function buildProbeOne({
   const tier = inferClaudeTier(
     {
       has_token: true,
-      account_tier: after?.unified?.account_tier || null,
+      account_tier:
+        after?.unified?.account_tier ||
+        vm.account_tier ||
+        vm.claude?.account_tier ||
+        vm.claude?.subscription_type ||
+        null,
       fable: qAfter.fable,
       utilization_7d_oi: qAfter.utilization_7d_oi,
       reset_7d_oi: qAfter.reset_7d_oi,
@@ -1252,7 +1257,7 @@ export async function buildProbeOne({
   if (completeUsage && (result.account_tier === 'pro' || result.account_tier === 'max')) {
     accountQuota.setAccountTier(accountId, result.account_tier, { source: 'usage' })
     persistAccountTier(cfg.paths.project, id, result.account_tier, { source: 'usage' })
-  } else if (completeUsage && (tier === 'pro' || tier === 'max')) {
+  } else if (completeUsage && result.usage_has_fable === false && (tier === 'pro' || tier === 'max')) {
     accountQuota.setAccountTier(accountId, tier, { source: 'usage' })
     persistAccountTier(cfg.paths.project, id, tier, { source: 'usage' })
   }
